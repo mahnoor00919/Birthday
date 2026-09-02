@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+<!-- <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
@@ -259,14 +259,15 @@
 <canvas id="confetti-canvas"></canvas>
 <div id="cursor-dot"></div>
 
-<!-- <button id="music-toggle" aria-label="Toggle music" title="Music">
+<button id="music-toggle" aria-label="Toggle music" title="Music">
   <svg viewBox="0 0 24 24" fill="none">
     <rect class="bar" x="4" y="10" width="3" height="8" rx="1.5" fill="#c67f92"/>
     <rect class="bar" x="10.5" y="6" width="3" height="12" rx="1.5" fill="#c67f92"/>
     <rect class="bar" x="17" y="12" width="3" height="6" rx="1.5" fill="#c67f92"/>
   </svg>
 </button>
-<div id="music-fallback">Tap for music ♪</div> -->
+
+<div id="music-fallback">Tap for music ♪</div>
 
 <script type="importmap">
 {
@@ -290,9 +291,6 @@ const CONTENT = {
   wish1: "May your life always find its way to the kind of happiness your heart quietly deserves🌷",
   wish2: "You deserve a year as wonderful as you are. ♡",
   celebrationSub: "Here's to another beautiful year of laughter, happiness and unforgettable memories. ♡",
-};
-const CONFIG = {
-  MUSIC_SRC: "./riverbend-serenade.mp3", // drop your track at public/audio/happy-birthday.mp3
 };
 
 let currentBg = 'intro';
@@ -930,9 +928,10 @@ function setupCutDrag(){
 
     knifeState.dragging = true;
     if(state === 'KNIFE_READY'){
-      // Start the track silently inside the user's pointer gesture. This
-      // satisfies autoplay policies without making any music audible yet.
-      prepareMusicSilently();
+      // Unlock the persistent audio element silently, synchronously inside
+      // this pointer gesture. This satisfies autoplay policy without
+      // making any music audible yet — see the Music section below.
+      unlockMusicFromGesture();
       setState('CUTTING');
       playSlice();
     }
@@ -984,16 +983,6 @@ function completeCut(){
   knifeState.cutDone = true;
   triggerShake(320, 0.05);
   spawnCakeSparkleBurst();
-
-  // The track has been silently unlocked during the cut. Reset it now so
-  // the song begins from the start when the celebration arrives.
-  if(audioEl && musicPlaying){
-    try{
-      audioEl.currentTime = 0;
-      audioEl.volume = 0;
-    }catch(err){}
-  }
-
   setTimeout(()=>{ setState('CELEBRATION'); }, 480);
 }
 
@@ -1434,119 +1423,226 @@ function runConfetti(){
 }
 
 /* ============================================================
-   7. Music
-    Music starts ONLY after the cake has been fully cut.
-    During the cutting gesture we silently start the audio element at
-    volume 0 so browser autoplay rules are satisfied. After the cut
-    completes, the track is reset to 0 and fades in as the celebration
-    begins. Nothing audible plays during the intro, wish, cake reveal,
-    candle, or knife-ready stages.
-   ============================================================ */
-let audioEl, musicPlaying = false, musicUnavailable = false, musicUserMuted = false;
-let musicFadeRAF = null;
+   7. Music — mobile-safe single-Audio-element implementation
+   ============================================================
 
-function ensureAudioEl(){
+   EDIT THIS to point at wherever the MP3 actually lives once deployed.
+   This must resolve as an absolute URL path on the live site.
+
+     - If your static/Vercel deployment serves files placed directly in
+       the project's `public/` folder, and the MP3 sits at
+         public/riverbend-serenade.mp3
+       then use:  "/riverbend-serenade.mp3"
+
+     - If instead your project structure is
+         public/audio/riverbend-serenade.mp3
+       then use:  "/audio/riverbend-serenade.mp3"
+
+   A relative path like "./riverbend-serenade.mp3" only works if this
+   HTML file is served from the exact same folder as the MP3 — it breaks
+   the moment the page is served from a different route (a common cause
+   of "works locally, silent on mobile/deployed site"). Always verify by
+   opening the final URL directly in a browser tab after deploying.
+*/
+const MUSIC_SRC = "/riverbend-serenade.mp3"; // <-- verify this against your actual deployed file path
+const MUSIC_DEBUG = true; // set to false once everything is confirmed working
+
+function musicLog(...args){ if(MUSIC_DEBUG) console.log('[Music]', ...args); }
+
+let audioEl = null;
+let musicPlaying = false;
+let musicUnavailable = false;
+let musicUserMuted = false;
+let musicFadeRAF = null;
+let musicUnlockPromise = null; // in-flight play() promise from the knife gesture
+
+function getAudioEl(){
   if(audioEl) return audioEl;
-  if(!CONFIG.MUSIC_SRC) return null;
-  audioEl = new Audio(CONFIG.MUSIC_SRC);
+  if(!MUSIC_SRC) return null;
+
+  audioEl = new Audio();
+  audioEl.preload = 'auto';
   audioEl.loop = true;
+  audioEl.playsInline = true;
+  audioEl.setAttribute('playsinline', '');
+  audioEl.setAttribute('webkit-playsinline', '');
   audioEl.volume = 0;
+  audioEl.src = MUSIC_SRC;
+
+  musicLog('source:', MUSIC_SRC);
+
+  audioEl.addEventListener('loadeddata', ()=> musicLog('loadeddata — readyState:', audioEl.readyState));
+  audioEl.addEventListener('canplay', ()=> musicLog('canplay — readyState:', audioEl.readyState));
+  audioEl.addEventListener('canplaythrough', ()=> musicLog('canplaythrough'));
   audioEl.addEventListener('error', ()=>{
     musicUnavailable = true;
-    const fb = document.getElementById('music-fallback');
-    if(fb) fb.classList.remove('show');
+    musicLog('ERROR loading audio — code:', audioEl.error?.code, 'message:', audioEl.error?.message, 'src:', MUSIC_SRC);
   });
+
+  // Start loading right away (not "load() right before play()") so the
+  // file is already buffered by the time the knife gesture happens.
+  audioEl.load();
+
   return audioEl;
+}
+
+/*
+ * Called synchronously from the knife's pointerdown handler — a real user
+ * gesture — so mobile browsers allow the play() call. Keeps the audio at
+ * volume 0. Only ever one play() request in flight: concurrent calls
+ * reuse the same promise instead of stacking up new ones. musicPlaying is
+ * only set to true once play() has actually resolved.
+ */
+function unlockMusicFromGesture(){
+  if(musicUserMuted || !MUSIC_SRC) return Promise.resolve(false);
+
+  const el = getAudioEl();
+  if(!el) return Promise.resolve(false);
+
+  if(musicPlaying && !el.paused){
+    return Promise.resolve(true);
+  }
+
+  if(musicUnlockPromise) return musicUnlockPromise;
+
+  el.volume = 0;
+  musicLog('unlockMusicFromGesture: calling play() — readyState:', el.readyState, 'paused:', el.paused);
+
+  musicUnlockPromise = el.play().then(()=>{
+    musicPlaying = true;
+    musicUnavailable = false;
+    el.volume = 0; // stays silent until CELEBRATION
+    musicToggle?.classList.add('playing');
+    musicFallback?.classList.remove('show');
+    musicLog('unlockMusicFromGesture: play() resolved');
+    return true;
+  }).catch((err)=>{
+    musicPlaying = false;
+    musicLog('unlockMusicFromGesture: play() rejected —', err?.name, err?.message);
+    musicFallback?.classList.add('show');
+    return false;
+  }).finally(()=>{
+    musicUnlockPromise = null;
+  });
+
+  return musicUnlockPromise;
 }
 
 function rampMusicVolume(target, durMs){
   if(!audioEl) return;
-  if(musicFadeRAF) cancelAnimationFrame(musicFadeRAF);
+  if(musicFadeRAF){ cancelAnimationFrame(musicFadeRAF); musicFadeRAF = null; }
   const from = audioEl.volume, t0 = performance.now();
   function step(now){
     if(!audioEl) return;
-    const t = Math.min(1, (now - t0) / durMs);
+    const t = Math.min(1, (now - t0)/durMs);
     audioEl.volume = from + (target - from) * t;
     if(t < 1) musicFadeRAF = requestAnimationFrame(step);
+    else musicFadeRAF = null;
   }
   musicFadeRAF = requestAnimationFrame(step);
 }
 
-function prepareMusicSilently(){
-  if(musicUserMuted || !CONFIG.MUSIC_SRC || musicPlaying) return;
-  const el = ensureAudioEl();
+/*
+ * Called exactly when CELEBRATION begins. Waits for the gesture-time
+ * unlock if it's still in flight (this is what fixes the "works on the
+ * second attempt" bug — the celebration used to check `musicPlaying`
+ * before the first-attempt play() promise had actually settled). Falls
+ * back to a direct play() if the gesture-time attempt was rejected, and
+ * only shows the manual "Tap for music" fallback if that also fails.
+ */
+async function musicHappiestPoint(){
+  if(musicUserMuted || !MUSIC_SRC) return;
+
+  const el = getAudioEl();
   if(!el) return;
-  el.volume = 0;
-  el.currentTime = 0;
-  el.play().then(()=>{
-    musicPlaying = true;
-    musicToggle?.classList.add('playing');
-    musicFallback?.classList.remove('show');
-    // Keep the track completely silent until the cake is actually cut.
+
+  if(musicUnlockPromise) await musicUnlockPromise;
+
+  if(musicPlaying && !el.paused){
+    try{ el.currentTime = 0; }catch(err){}
     el.volume = 0;
-  }).catch(()=>{});
-}
-
-function musicHappiestPoint(){
-  if(musicUserMuted || !CONFIG.MUSIC_SRC) return;
-  const el = ensureAudioEl();
-  if(!el) return;
-
-  // The audio element was started silently during the cutting gesture so
-  // the final delayed celebration transition can safely become audible.
-  if(!musicPlaying){
-    prepareMusicSilently();
-    setTimeout(()=>{
-      if(!audioEl || musicUserMuted) return;
-      audioEl.currentTime = 0;
-      rampMusicVolume(0.66, 1200);
-    }, 80);
+    rampMusicVolume(0.66, 1200);
+    musicLog('celebration: fading in gesture-unlocked audio');
     return;
   }
 
-  el.currentTime = 0;
-  rampMusicVolume(0.66, 1200);
+  // Gesture-time play() was blocked or never ran — try once more directly.
+  el.volume = 0;
+  try{ el.currentTime = 0; }catch(err){}
+
+  try{
+    await el.play();
+    musicPlaying = true;
+    musicUnavailable = false;
+    musicToggle?.classList.add('playing');
+    musicFallback?.classList.remove('show');
+    try{ el.currentTime = 0; }catch(err){}
+    rampMusicVolume(0.66, 1200);
+    musicLog('celebration: fallback play() succeeded');
+  }catch(err){
+    musicLog('celebration: play() blocked, showing manual fallback —', err?.name, err?.message);
+    musicFallback?.classList.add('show');
+  }
 }
 
 const musicToggle = document.getElementById('music-toggle');
 const musicFallback = document.getElementById('music-fallback');
 
-if (musicToggle) musicToggle.addEventListener('click', ()=>{
-  if(!CONFIG.MUSIC_SRC) return;
-  const el = ensureAudioEl();
-  if(!el) return;
-  if(musicPlaying){
-    el.pause();
-    musicPlaying = false;
-    musicUserMuted = true;
-    musicToggle?.classList.remove('playing');
-  } else {
+if(musicToggle){
+  musicToggle.addEventListener('click', ()=>{
+    if(!MUSIC_SRC) return;
+    const el = getAudioEl();
+    if(!el) return;
+
+    if(musicFadeRAF){ cancelAnimationFrame(musicFadeRAF); musicFadeRAF = null; }
+
+    if(musicPlaying && !el.paused){
+      el.pause();
+      musicPlaying = false;
+      musicUserMuted = true;
+      musicToggle.classList.remove('playing');
+    } else {
+      musicUserMuted = false;
+      const startVol = el.volume < 0.02 ? 0 : el.volume;
+      el.volume = startVol;
+      el.play().then(()=>{
+        musicPlaying = true;
+        musicToggle.classList.add('playing');
+        musicFallback?.classList.remove('show');
+        if(el.volume < 0.02) rampMusicVolume(0.66, 800);
+      }).catch((err)=>{
+        musicLog('manual toggle play() failed —', err?.name, err?.message);
+        musicFallback?.classList.add('show');
+      });
+    }
+  });
+}
+
+if(musicFallback){
+  musicFallback.addEventListener('click', ()=>{
+    const el = getAudioEl();
+    if(!el) return;
     musicUserMuted = false;
+    el.volume = 0;
+    try{ el.currentTime = 0; }catch(err){}
     el.play().then(()=>{
       musicPlaying = true;
+      musicUnavailable = false;
+      musicFallback.classList.remove('show');
       musicToggle?.classList.add('playing');
-      musicFallback?.classList.remove('show');
-      if(el.volume < 0.02) rampMusicVolume(0.05, 800);
-    }).catch(()=>{});
-  }
-});
-if (musicFallback) musicFallback.addEventListener('click', ()=>{
-  const el = ensureAudioEl();
-  if(!el) return;
-  el.play().then(()=>{
-    musicPlaying = true;
-    musicUserMuted = false;
-    musicToggle?.classList.add('playing');
-    musicFallback?.classList.remove('show');
-    if(el.volume < 0.02) rampMusicVolume(0.05, 800);
-  }).catch(()=>{});
-});
+      rampMusicVolume(0.66, 1200);
+    }).catch((err)=>{
+      musicLog('manual fallback play() failed —', err?.name, err?.message);
+    });
+  });
+}
 
 /* ============================================================
    8. Manual page navigation (Page 1 → Page 2 → cake)
    Click/tap, scroll down, swipe up, or ArrowDown/Space/Enter.
-   This is also where audio first unlocks, satisfying the browser's
-   autoplay policy.
+   This is also where the SFX audio context first unlocks, satisfying
+   the browser's autoplay policy for the synthesized chime/whoosh/slice
+   sounds — separate from the music, which unlocks during the knife cut.
    ============================================================ */
 let firstInteractionDone = false;
 let navBusy = false;
@@ -1554,8 +1650,6 @@ let navBusy = false;
 function ensureFirstInteraction(){
   if(firstInteractionDone) return;
   firstInteractionDone = true;
-  // Unlock only the synthesized SFX context here. Music must remain silent
-  // until the cake has actually been cut.
   const ctx = getSfxCtx();
   if(ctx && ctx.state === 'suspended') ctx.resume().catch(()=>{});
 }
@@ -1621,8 +1715,11 @@ window.addEventListener('keydown', (e)=>{
 function resetExperience(){
   clearTimer();
   stopMic();
-  if(audioEl){ audioEl.pause(); audioEl.currentTime = 0; audioEl.volume = 0; }
+
+  if(musicFadeRAF){ cancelAnimationFrame(musicFadeRAF); musicFadeRAF = null; }
+  if(audioEl){ audioEl.pause(); try{ audioEl.currentTime = 0; }catch(err){} audioEl.volume = 0; }
   musicPlaying = false;
+  musicUnlockPromise = null;
   musicToggle?.classList.remove('playing');
   musicFallback?.classList.remove('show');
 
@@ -1647,8 +1744,3211 @@ function resetExperience(){
    10. Boot
    ============================================================ */
 spawnPetals();
+getAudioEl(); // kick off loading the track early so it's ready well before the knife gesture
+setState('INTRO');
+</script>
+</body>
+</html> -->
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+
+
+<meta name="color-scheme" content="only light">
+<meta name="theme-color" content="#fbeef0">
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, viewport-fit=cover" />
+<title>Happy Birthday, Fatima</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300;0,9..144,400;0,9..144,500;0,9..144,600;1,9..144,400;1,9..144,500&family=Manrope:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<!-- <style>
+  :root{
+    --blush: #fbeef0;
+    --blush-deep: #f6dfe4;
+    --rose: #e2a3b3;
+    --rose-deep: #c67f92;
+    --plum: #3d2b34;
+    --plum-soft: #6b5560;
+    --cream: #fff8f2;
+    --lavender: #ece3f2;
+    --gold: #d8b98a;
+  }
+  *{box-sizing:border-box; margin:0; padding:0;}
+  html, body{
+    height:100%;
+    overflow:hidden;
+    overscroll-behavior:none;
+  }
+  body{
+    font-family:'Manrope', sans-serif;
+    color:var(--plum);
+    background:var(--blush);
+    -webkit-font-smoothing:antialiased;
+    -webkit-user-select:none; user-select:none;
+  }
+  .serif{ font-family:'Fraunces', serif; }
+  ::selection{ background:var(--rose); color:#fff; }
+
+  @media (prefers-reduced-motion: reduce){
+    *{ animation-duration:0.01ms !important; animation-iteration-count:1 !important; transition-duration:0.01ms !important; }
+  }
+
+  /* ============ APP SHELL — ONE VIEWPORT, NO SCROLL ============ */
+  #app{
+    position:fixed; inset:0;
+    height:100svh; min-height:100svh; width:100vw;
+    overflow:hidden;
+    isolation:isolate;
+  }
+
+  #particle-canvas{ position:absolute; inset:0; width:100%; height:100%; pointer-events:none; z-index:3; mix-blend-mode:multiply; }
+  #confetti-canvas{ position:fixed; inset:0; width:100vw; height:100vh; pointer-events:none; z-index:50; }
+  #fx-layer{ position:absolute; inset:0; pointer-events:none; z-index:6; overflow:hidden; }
+
+  /* ---------- background choreography ---------- */
+  #bg-stack{ position:absolute; inset:0; z-index:0; }
+  .bg-layer{ position:absolute; inset:0; opacity:0; transition:opacity 2.1s ease; }
+  .bg-layer.active{ opacity:1; }
+  .bg-intro{ background: radial-gradient(120% 90% at 50% 20%, #fff6f8 0%, var(--blush) 55%, var(--blush-deep) 100%);
+    background-size:160% 160%; animation: bgDrift 46s ease-in-out infinite alternate; }
+  @keyframes bgDrift{ from{ background-position:46% 22%; } to{ background-position:54% 34%; } }
+
+  /* ---------- breathing glow (Page 1 only) ---------- */
+  #intro-glow{ position:absolute; left:50%; top:46%; width:min(60vw,560px); height:min(60vw,560px);
+    transform:translate(-50%,-50%); border-radius:50%; z-index:1; pointer-events:none;
+    background:radial-gradient(circle, rgba(255,246,240,0.55) 0%, rgba(226,163,179,0.16) 45%, transparent 74%);
+    filter:blur(10px); opacity:0; transition:opacity 2.4s ease; animation: introBreathe 7s ease-in-out infinite; }
+  #intro-glow.on{ opacity:1; }
+  @keyframes introBreathe{ 0%,100%{ transform:translate(-50%,-50%) scale(0.94); } 50%{ transform:translate(-50%,-50%) scale(1.05); } }
+  .bg-wish{ background: radial-gradient(120% 100% at 50% 25%, #fdeef3 0%, var(--blush-deep) 45%, var(--lavender) 100%); }
+  .bg-cake{ background: radial-gradient(120% 100% at 50% 30%, #2c1e24 0%, #1c1319 60%, #140d11 100%); }
+  .bg-candles{ background: radial-gradient(115% 100% at 50% 55%, #3a2420 0%, #23151a 55%, #170e12 100%); }
+  .bg-cut{ background: radial-gradient(120% 100% at 50% 40%, #2e1c22 0%, #1c1319 55%, #170e12 100%),
+                        radial-gradient(60% 50% at 50% 75%, rgba(226,163,179,0.16) 0%, transparent 70%); }
+  .bg-celebration{ background: radial-gradient(120% 90% at 50% 20%, #fff9f6 0%, var(--blush) 50%, var(--lavender) 100%); }
+
+  #vignette{ position:absolute; inset:0; z-index:2; pointer-events:none; opacity:0; transition:opacity 2s ease;
+    background: radial-gradient(120% 90% at 50% 45%, transparent 45%, rgba(10,6,8,0.55) 100%); }
+  #vignette.on{ opacity:1; }
+
+  #flash{ position:absolute; inset:0; z-index:7; pointer-events:none; background:#fff6ec; opacity:0; transition:opacity .18s ease-out; }
+  #flash.on{ opacity:.5; transition:opacity .05s ease-out; }
+
+  .cake-glow{ position:absolute; left:50%; top:56%; width:min(70vw,720px); height:min(70vw,720px);
+    transform:translate(-50%,-50%); border-radius:50%; z-index:1; pointer-events:none;
+    background:radial-gradient(circle, rgba(255,196,150,0.30) 0%, rgba(226,163,179,0.14) 40%, transparent 72%);
+    filter:blur(18px); mix-blend-mode:screen; opacity:0; transition:opacity 2s ease; }
+  .cake-glow.on{ opacity:1; }
+
+  /* ---------- cake canvas ---------- */
+  #cake-canvas-wrap{ position:absolute; inset:0; z-index:4; opacity:0; transition:opacity 1.8s ease, filter 1.8s ease; }
+  #cake-canvas-wrap.visible{ opacity:1; }
+  #cake-canvas-wrap.dimmed{ opacity:0.32; filter:blur(2px) saturate(0.9); }
+  #cake-canvas-wrap canvas{ display:block; width:100% !important; height:100% !important; touch-action:none; }
+
+  /* ---------- text stage ---------- */
+  #text-top{ position:absolute; top:3.4vh; left:50%; transform:translateX(-50%); z-index:8;
+    width:min(92vw, 640px); text-align:center; pointer-events:none;
+    text-shadow:0 8px 30px rgba(18,10,14,0.55); }
+  #text-center{ position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); z-index:5;
+    width:min(92vw, 680px); text-align:center; pointer-events:none; }
+  #text-bottom{ position:absolute; bottom:7vh; left:50%; transform:translateX(-50%); z-index:5;
+    width:min(92vw, 520px); text-align:center; }
+
+  .fade-block{ opacity:0; transition:opacity .7s ease, transform .7s cubic-bezier(.22,1,.36,1); transform:translateY(10px); }
+  .fade-block.in{ opacity:1; transform:translateY(0); }
+  .fade-block.out{ opacity:0; transform:translateY(-8px); transition:opacity .5s ease, transform .5s ease; }
+
+  /* ---------- staggered intro headline / name ---------- */
+  .intro-headline{ opacity:0; transform:translateY(14px); animation: lineIn 1s cubic-bezier(.22,1,.36,1) .1s forwards; }
+  .intro-name{ opacity:0; transform:translateY(14px); animation: lineIn 1.1s cubic-bezier(.22,1,.36,1) .85s forwards; }
+  .intro-rest{ opacity:0; transform:translateY(10px); animation: lineIn 1s cubic-bezier(.22,1,.36,1) 1.5s forwards; }
+  @keyframes lineIn{ to{ opacity:1; transform:translateY(0); } }
+
+  /* ---------- line-by-line message reveal (Page 2) ---------- */
+  .wish-line{ opacity:0; transform:translateY(14px); animation: lineIn .9s cubic-bezier(.22,1,.36,1) forwards; }
+
+  .continue-hint{ font-size:0.78rem; letter-spacing:0.08em; color:var(--plum-soft); opacity:0.4;
+    animation: hintPulse 2.6s ease-in-out infinite; pointer-events:none; }
+  .continue-hint.light{ color:#e7d3d3; }
+  @keyframes hintPulse{ 0%,100%{ opacity:.32; } 50%{ opacity:.72; } }
+
+  /* ---------- converging particles (cake transition) ---------- */
+  .converge-spark{ position:absolute; width:4px; height:4px; border-radius:50%; margin:-2px 0 0 -2px;
+    background:radial-gradient(circle, #fff 0%, var(--gold) 60%, transparent 100%);
+    opacity:0.9; transition: transform .95s cubic-bezier(.22,1,.36,1), opacity .95s ease; pointer-events:none; }
+
+  /* ---------- cursor trail particles ---------- */
+  .cursor-trail{ position:absolute; pointer-events:none; opacity:0.55; margin:-3px 0 0 -3px;
+    animation: trailFade .65s ease-out forwards; }
+  .cursor-trail.dot{ width:5px; height:5px; border-radius:50%;
+    background:radial-gradient(circle, #fff 0%, var(--rose) 65%, transparent 100%); }
+  .cursor-trail.spark{ width:6px; height:6px; border-radius:50%;
+    background:radial-gradient(circle, #fff 0%, var(--gold) 60%, transparent 100%); }
+  .cursor-trail.heart{ width:8px; height:8px; }
+  .cursor-trail.heart::before{ content:''; position:absolute; inset:0;
+    background:var(--rose-deep); clip-path:path('M4 7.4C1.6 5.6 0 4 0 2.4 0 1.1 1 0 2.4 0c.9 0 1.6.5 1.6 1.1C4.6.5 5.3 0 6.2 0 7.6 0 8.6 1.1 8.6 2.4 8.6 4 7 5.6 4.6 7.4Z'); opacity:0.8; }
+  @keyframes trailFade{ 0%{ opacity:0.6; transform:scale(1); } 100%{ opacity:0; transform:scale(0.4) translateY(6px); } }
+
+  .eyebrow{ font-size:0.92rem; letter-spacing:0.05em; color:var(--plum-soft); margin-bottom:10px; }
+  .eyebrow.light{ color:#e7d3d3; }
+  .headline{ font-family:'Fraunces', serif; font-weight:400; font-size:clamp(2.3rem, 7.6vw, 4.6rem); line-height:1.03; letter-spacing:-0.01em; }
+  .name-line{ margin-top:4px; font-family:'Fraunces', serif; font-style:italic; font-weight:500;
+    font-size:clamp(2.8rem, 9.5vw, 6rem); color:var(--rose-deep); text-shadow:0 0 40px rgba(226,163,179,0.35); }
+  .subline{ margin-top:20px; font-size:1.02rem; color:var(--plum-soft); }
+  .micro{ margin-top:22px; font-size:0.78rem; letter-spacing:0.1em; color:var(--plum-soft); opacity:0.85; }
+
+  .wish-kicker{ font-size:1rem; color:var(--rose-deep); font-family:'Fraunces', serif; font-style:italic; margin-bottom:12px; }
+  .wish-text{ font-family:'Fraunces', serif; font-weight:400; font-size:clamp(1.3rem, 3.2vw, 2.1rem); line-height:1.35; }
+  .wish-text.small{ margin-top:20px; font-size:clamp(1.05rem, 2.2vw, 1.4rem); color:var(--plum-soft); font-style:italic; }
+  .stroke-heart{ width:46px; height:40px; margin:0 auto 18px; opacity:0.75; }
+  .stroke-heart path{ fill:none; stroke:var(--rose-deep); stroke-width:1.4; stroke-linecap:round;
+    stroke-dasharray:140; stroke-dashoffset:140; animation:strokeIn 1.4s .2s ease forwards; }
+  @keyframes strokeIn{ to{ stroke-dashoffset:0; } }
+
+  .cake-caption{ font-family:'Fraunces', serif; font-weight:400; font-size:clamp(1.25rem, 3vw, 1.9rem); color:#fdf3ef; letter-spacing:0.01em; }
+  .cake-sub{ margin-top:7px; color:#dcc7c7; font-size:0.82rem; letter-spacing:0.06em; }
+  .fade-block.rise{ animation:riseIn 1.6s cubic-bezier(.22,1,.36,1) both; }
+  @keyframes riseIn{ from{ opacity:0; transform:translateY(16px) scale(.985); } to{ opacity:1; transform:translateY(0) scale(1); } }
+  .cake-sub.light{ color:var(--plum-soft); }
+
+  .btn{ font-family:'Manrope', sans-serif; font-weight:600; font-size:0.9rem; letter-spacing:0.01em;
+    padding:13px 28px; border-radius:100px; border:none; cursor:pointer;
+    background:rgba(255,255,255,0.14); color:#fdf3ef; backdrop-filter:blur(14px);
+    border:1px solid rgba(255,255,255,0.28); box-shadow:0 10px 30px rgba(20,10,14,0.25);
+    transition:transform 0.25s ease, box-shadow 0.25s ease, background .25s ease; pointer-events:auto; }
+  .btn:hover{ transform:translateY(-2px); background:rgba(255,255,255,0.22); }
+  .btn:active{ transform:translateY(0); }
+  .btn.solid{ background:var(--rose-deep); color:#fff; border:none; box-shadow:0 10px 30px rgba(198,127,146,0.4); }
+  .btn.solid:hover{ background:#b76d80; }
+  .btn.dark{ background:var(--plum); color:#fff; border:none; }
+
+  .mic-row{ display:flex; align-items:center; justify-content:center; gap:10px; margin:16px 0 18px; pointer-events:auto; }
+  .mic-icon{ width:36px; height:36px; border-radius:50%; border:1px solid rgba(255,255,255,0.35);
+    display:flex; align-items:center; justify-content:center; position:relative; flex:none; cursor:pointer; }
+  .mic-icon .ring{ position:absolute; inset:-6px; border-radius:50%; border:1px solid var(--rose); opacity:0; transform:scale(0.8); }
+  .mic-icon.active .ring{ animation:micPulse 1.1s ease-out infinite; }
+  @keyframes micPulse{ 0%{opacity:0.7; transform:scale(0.8);} 100%{opacity:0; transform:scale(1.6);} }
+  .mic-hint{ font-size:0.85rem; color:#dcc7c7; text-align:left; }
+
+  .cut-guide{ position:absolute; left:50%; top:30%; bottom:30%; width:2px; transform:translateX(-50%);
+    background:linear-gradient(180deg, transparent, rgba(255,214,180,0.85), transparent);
+    box-shadow:0 0 18px 2px rgba(255,196,150,0.5); z-index:4; opacity:0; transition:opacity .9s ease; pointer-events:none; }
+  .cut-guide.on{ opacity:1; animation:guidePulse 1.8s ease-in-out infinite; }
+  .cut-guide.fading{ opacity:0; }
+  @keyframes guidePulse{ 0%,100%{opacity:.55;} 50%{opacity:1;} }
+
+  .celebration-title{ font-family:'Fraunces', serif; font-weight:400; font-size:clamp(2.1rem, 6.6vw, 4rem); color:var(--rose-deep); }
+  .celebration-sub{ margin-top:16px; max-width:520px; font-size:1.02rem; color:var(--plum-soft); line-height:1.6; margin-left:auto; margin-right:auto; }
+
+  /* ---------- music toggle ---------- */
+  #music-toggle{ position:fixed; top:calc(18px + env(safe-area-inset-top)); right:calc(18px + env(safe-area-inset-right)); z-index:60;
+    width:44px; height:44px; border-radius:50%; background:rgba(255,255,255,0.55); backdrop-filter:blur(10px);
+    border:1px solid rgba(255,255,255,0.7); display:flex; align-items:center; justify-content:center;
+    cursor:pointer; box-shadow:0 8px 24px rgba(198,127,146,0.2); transition:transform 0.25s ease; }
+  #music-toggle:hover{ transform:scale(1.06); }
+  #music-toggle svg{ width:18px; height:18px; }
+  #music-toggle .bar{ transform-origin:bottom; transition:transform .2s ease; }
+  #music-toggle.playing .bar{ animation:bar 0.9s ease-in-out infinite alternate; }
+  #music-toggle .bar:nth-child(2){ animation-delay:0.15s; }
+  #music-toggle .bar:nth-child(3){ animation-delay:0.3s; }
+  @keyframes bar{ from{ transform:scaleY(0.3);} to{ transform:scaleY(1);} }
+
+  /* Subtle floating music note fallback */
+  #music-fallback{
+    position:fixed;
+    bottom:calc(28px + env(safe-area-inset-bottom));
+    left:50%;
+    transform:translateX(-50%) translateY(12px);
+    z-index:60;
+    width:46px; height:46px;
+    border-radius:50%;
+    background:rgba(255,255,255,0.72);
+    backdrop-filter:blur(12px);
+    border:1px solid rgba(255,255,255,0.85);
+    box-shadow:0 8px 28px rgba(198,127,146,0.22);
+    display:flex; align-items:center; justify-content:center;
+    opacity:0; pointer-events:none;
+    transition:opacity .5s ease, transform .5s cubic-bezier(.22,1,.36,1);
+    cursor:pointer;
+  }
+  #music-fallback.show{
+    opacity:1;
+    pointer-events:auto;
+    transform:translateX(-50%) translateY(0);
+  }
+  #music-fallback.hiding{
+    opacity:0;
+    transform:translateX(-50%) translateY(10px);
+    pointer-events:none;
+  }
+  #music-fallback svg{
+    width:20px; height:20px;
+    fill:var(--rose-deep);
+  }
+  #music-fallback.pulse svg{
+    animation: notePulse 1.8s ease-in-out infinite;
+  }
+  @keyframes notePulse{
+    0%,100%{ transform:scale(1); opacity:0.85; }
+    50%{ transform:scale(1.12); opacity:1; }
+  }
+
+  /* ---------- custom cursor (desktop only) ---------- */
+  #cursor-dot{ position:fixed; top:0; left:0; width:8px; height:8px; border-radius:50%; background:var(--rose-deep);
+    pointer-events:none; z-index:70; transform:translate(-50%,-50%); transition:width .2s ease, height .2s ease, background .2s ease; opacity:0; }
+  #cursor-dot.show{ opacity:0.85; }
+  #cursor-dot.expand{ width:30px; height:30px; background:transparent; border:1.5px solid var(--rose-deep); }
+  @media (hover:none), (pointer:coarse){ #cursor-dot{ display:none; } }
+
+  .sparkle{ position:absolute; width:5px; height:5px; border-radius:50%; pointer-events:none;
+    background:radial-gradient(circle, #fff 0%, var(--gold) 60%, transparent 100%);
+    animation:sparkleFx .9s ease-out forwards; }
+  @keyframes sparkleFx{ 0%{ transform:scale(0) translateY(0); opacity:0; } 25%{ opacity:1; } 100%{ transform:scale(1.3) translateY(-16px); opacity:0; } }
+
+  .petal{ position:absolute; border-radius:60% 0 60% 0; pointer-events:none;
+    background:linear-gradient(135deg, var(--rose), var(--blush-deep)); opacity:0.5; }
+  @keyframes petalFloat{ 0%,100%{ transform:translateY(0) rotate(0deg);} 50%{ transform:translateY(-22px) rotate(18deg);} }
+
+  .sr-only{ position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); }
+
+  @media (max-width: 640px){
+    #text-top{ top:2.2vh; }
+    #text-bottom{ bottom:5vh; }
+    .cake-glow{ width:92vw; height:92vw; }
+  }
+</style> -->
+<style>
+  :root{
+    /*
+      IMPORTANT:
+      This website is intentionally designed as a LIGHT experience.
+      Prevent browsers/phones from automatically darkening the colors.
+    */
+    color-scheme: only light;
+
+    --blush: #fbeef0;
+    --blush-deep: #f6dfe4;
+
+    /* ORIGINAL PINK PALETTE — DO NOT CHANGE IN DARK MODE */
+    --rose: #e2a3b3;
+    --rose-deep: #c67f92;
+    --birthday-pink: #c67f92;
+
+    --plum: #3d2b34;
+    --plum-soft: #6b5560;
+    --cream: #fff8f2;
+    --lavender: #ece3f2;
+    --gold: #d8b98a;
+  }
+
+  /*
+    Force the exact same palette even when the user's
+    phone/browser/OS is in dark mode.
+  */
+  @media (prefers-color-scheme: dark){
+    :root{
+      color-scheme: only light;
+
+      --blush: #fbeef0;
+      --blush-deep: #f6dfe4;
+      --rose: #e2a3b3;
+      --rose-deep: #c67f92;
+      --birthday-pink: #c67f92;
+      --plum: #3d2b34;
+      --plum-soft: #6b5560;
+      --cream: #fff8f2;
+      --lavender: #ece3f2;
+      --gold: #d8b98a;
+    }
+
+    html,
+    body,
+    #app{
+      color-scheme: only light;
+    }
+  }
+
+  *{
+    box-sizing:border-box;
+    margin:0;
+    padding:0;
+  }
+
+  html,
+  body{
+    height:100%;
+    overflow:hidden;
+    overscroll-behavior:none;
+
+    /*
+      Prevent automatic darkening of the page.
+    */
+    color-scheme:only light;
+  }
+
+  body{
+    font-family:'Manrope', sans-serif;
+    color:var(--plum);
+    background:var(--blush);
+
+    -webkit-font-smoothing:antialiased;
+    -webkit-user-select:none;
+    user-select:none;
+
+    /*
+      Keep browser rendering in light mode.
+    */
+    forced-color-adjust:none;
+  }
+
+  .serif{
+    font-family:'Fraunces', serif;
+  }
+
+  ::selection{
+    background:var(--rose);
+    color:#fff;
+  }
+
+  @media (prefers-reduced-motion: reduce){
+    *{
+      animation-duration:0.01ms !important;
+      animation-iteration-count:1 !important;
+      transition-duration:0.01ms !important;
+    }
+  }
+
+
+  /* =========================================================
+     APP SHELL — ONE VIEWPORT, NO SCROLL
+     ========================================================= */
+
+  #app{
+    position:fixed;
+    inset:0;
+    height:100svh;
+    min-height:100svh;
+    width:100vw;
+    overflow:hidden;
+    isolation:isolate;
+
+    /*
+      Never let the browser automatically recolor this app.
+    */
+    color-scheme:only light;
+    forced-color-adjust:none;
+  }
+
+
+  /* =========================================================
+     PARTICLES / FX
+     ========================================================= */
+
+  #particle-canvas{
+    position:absolute;
+    inset:0;
+    width:100%;
+    height:100%;
+    pointer-events:none;
+    z-index:3;
+
+    /*
+      CHANGED:
+      multiply can make pink/rose colors look darker.
+      Keep particles at their real colors.
+    */
+    mix-blend-mode:normal;
+  }
+
+  #confetti-canvas{
+    position:fixed;
+    inset:0;
+    width:100vw;
+    height:100vh;
+    pointer-events:none;
+    z-index:50;
+  }
+
+  #fx-layer{
+    position:absolute;
+    inset:0;
+    pointer-events:none;
+    z-index:6;
+    overflow:hidden;
+  }
+
+
+  /* =========================================================
+     BACKGROUND CHOREOGRAPHY
+     ========================================================= */
+
+  #bg-stack{
+    position:absolute;
+    inset:0;
+    z-index:0;
+  }
+
+  .bg-layer{
+    position:absolute;
+    inset:0;
+    opacity:0;
+    transition:opacity 2.1s ease;
+  }
+
+  .bg-layer.active{
+    opacity:1;
+  }
+
+  .bg-intro{
+    background:
+      radial-gradient(
+        120% 90% at 50% 20%,
+        #fff6f8 0%,
+        var(--blush) 55%,
+        var(--blush-deep) 100%
+      );
+
+    background-size:160% 160%;
+    animation:bgDrift 46s ease-in-out infinite alternate;
+  }
+
+  @keyframes bgDrift{
+    from{
+      background-position:46% 22%;
+    }
+
+    to{
+      background-position:54% 34%;
+    }
+  }
+
+  /* PAGE 2 */
+
+  .bg-wish{
+    background:
+      radial-gradient(
+        120% 100% at 50% 25%,
+        #fdeef3 0%,
+        var(--blush-deep) 45%,
+        var(--lavender) 100%
+      );
+  }
+
+  /* DARK CINEMATIC CAKE SCENES
+     These are intentionally dark and are NOT affected by
+     the user's phone dark mode. */
+
+  .bg-cake{
+    background:
+      radial-gradient(
+        120% 100% at 50% 30%,
+        #2c1e24 0%,
+        #1c1319 60%,
+        #140d11 100%
+      );
+  }
+
+  .bg-candles{
+    background:
+      radial-gradient(
+        115% 100% at 50% 55%,
+        #3a2420 0%,
+        #23151a 55%,
+        #170e12 100%
+      );
+  }
+
+  .bg-cut{
+    background:
+      radial-gradient(
+        120% 100% at 50% 40%,
+        #2e1c22 0%,
+        #1c1319 55%,
+        #170e12 100%
+      ),
+      radial-gradient(
+        60% 50% at 50% 75%,
+        rgba(226,163,179,0.16) 0%,
+        transparent 70%
+      );
+  }
+
+  .bg-celebration{
+    background:
+      radial-gradient(
+        120% 90% at 50% 20%,
+        #fff9f6 0%,
+        var(--blush) 50%,
+        var(--lavender) 100%
+      );
+  }
+
+
+  /* =========================================================
+     VIGNETTE
+     ========================================================= */
+
+  #vignette{
+    position:absolute;
+    inset:0;
+    z-index:2;
+    pointer-events:none;
+    opacity:0;
+    transition:opacity 2s ease;
+
+    background:
+      radial-gradient(
+        120% 90% at 50% 45%,
+        transparent 45%,
+        rgba(10,6,8,0.55) 100%
+      );
+  }
+
+  #vignette.on{
+    opacity:1;
+  }
+
+
+  /* =========================================================
+     FLASH
+     ========================================================= */
+
+  #flash{
+    position:absolute;
+    inset:0;
+    z-index:7;
+    pointer-events:none;
+    background:#fff6ec;
+    opacity:0;
+    transition:opacity .18s ease-out;
+  }
+
+  #flash.on{
+    opacity:.5;
+    transition:opacity .05s ease-out;
+  }
+
+
+  /* =========================================================
+     CAKE GLOW
+     ========================================================= */
+
+  .cake-glow{
+    position:absolute;
+    left:50%;
+    top:56%;
+    width:min(70vw,720px);
+    height:min(70vw,720px);
+    transform:translate(-50%,-50%);
+    border-radius:50%;
+    z-index:1;
+    pointer-events:none;
+
+    background:
+      radial-gradient(
+        circle,
+        rgba(255,196,150,0.30) 0%,
+        rgba(226,163,179,0.14) 40%,
+        transparent 72%
+      );
+
+    filter:blur(18px);
+    mix-blend-mode:screen;
+    opacity:0;
+    transition:opacity 2s ease;
+  }
+
+  .cake-glow.on{
+    opacity:1;
+  }
+
+
+  /* =========================================================
+     INTRO GLOW
+     ========================================================= */
+
+  #intro-glow{
+    position:absolute;
+    left:50%;
+    top:46%;
+    width:min(60vw,560px);
+    height:min(60vw,560px);
+    transform:translate(-50%,-50%);
+    border-radius:50%;
+    z-index:1;
+    pointer-events:none;
+
+    background:
+      radial-gradient(
+        circle,
+        rgba(255,246,240,0.55) 0%,
+        rgba(226,163,179,0.16) 45%,
+        transparent 74%
+      );
+
+    filter:blur(10px);
+    opacity:0;
+    transition:opacity 2.4s ease;
+    animation:introBreathe 7s ease-in-out infinite;
+  }
+
+  #intro-glow.on{
+    opacity:1;
+  }
+
+  @keyframes introBreathe{
+    0%,100%{
+      transform:translate(-50%,-50%) scale(0.94);
+    }
+
+    50%{
+      transform:translate(-50%,-50%) scale(1.05);
+    }
+  }
+
+
+  /* =========================================================
+     CAKE CANVAS
+     ========================================================= */
+
+  #cake-canvas-wrap{
+    position:absolute;
+    inset:0;
+    z-index:4;
+    opacity:0;
+    transition:
+      opacity 1.8s ease,
+      filter 1.8s ease;
+  }
+
+  #cake-canvas-wrap.visible{
+    opacity:1;
+  }
+
+  #cake-canvas-wrap.dimmed{
+    opacity:0.32;
+    filter:blur(2px) saturate(0.9);
+  }
+
+  #cake-canvas-wrap canvas{
+    display:block;
+    width:100% !important;
+    height:100% !important;
+    touch-action:none;
+  }
+
+
+  /* =========================================================
+     TEXT STAGE
+     ========================================================= */
+
+  #text-top{
+    position:absolute;
+    top:3.4vh;
+    left:50%;
+    transform:translateX(-50%);
+    z-index:8;
+    width:min(92vw,640px);
+    text-align:center;
+    pointer-events:none;
+    text-shadow:0 8px 30px rgba(18,10,14,0.55);
+  }
+
+  #text-center{
+    position:absolute;
+    top:50%;
+    left:50%;
+    transform:translate(-50%,-50%);
+    z-index:5;
+    width:min(92vw,680px);
+    text-align:center;
+    pointer-events:none;
+  }
+
+  #text-bottom{
+    position:absolute;
+    bottom:7vh;
+    left:50%;
+    transform:translateX(-50%);
+    z-index:5;
+    width:min(92vw,520px);
+    text-align:center;
+  }
+
+
+  /* =========================================================
+     FADE ANIMATIONS
+     ========================================================= */
+
+  .fade-block{
+    opacity:0;
+    transition:
+      opacity .7s ease,
+      transform .7s cubic-bezier(.22,1,.36,1);
+    transform:translateY(10px);
+  }
+
+  .fade-block.in{
+    opacity:1;
+    transform:translateY(0);
+  }
+
+  .fade-block.out{
+    opacity:0;
+    transform:translateY(-8px);
+    transition:
+      opacity .5s ease,
+      transform .5s ease;
+  }
+
+
+  /* =========================================================
+     INTRO
+     ========================================================= */
+
+  .intro-headline{
+    opacity:0;
+    transform:translateY(14px);
+    animation:
+      lineIn 1s cubic-bezier(.22,1,.36,1) .1s forwards;
+  }
+
+  .intro-name{
+    opacity:0;
+    transform:translateY(14px);
+    animation:
+      lineIn 1.1s cubic-bezier(.22,1,.36,1) .85s forwards;
+  }
+
+  .intro-rest{
+    opacity:0;
+    transform:translateY(10px);
+    animation:
+      lineIn 1s cubic-bezier(.22,1,.36,1) 1.5s forwards;
+  }
+
+  @keyframes lineIn{
+    to{
+      opacity:1;
+      transform:translateY(0);
+    }
+  }
+
+
+  /* =========================================================
+     WISH
+     ========================================================= */
+
+  .wish-line{
+    opacity:0;
+    transform:translateY(14px);
+    animation:
+      lineIn .9s cubic-bezier(.22,1,.36,1) forwards;
+  }
+
+  .continue-hint{
+    font-size:0.78rem;
+    letter-spacing:0.08em;
+    color:var(--plum-soft);
+    opacity:0.4;
+    animation:hintPulse 2.6s ease-in-out infinite;
+    pointer-events:none;
+  }
+
+  .continue-hint.light{
+    color:#e7d3d3;
+  }
+
+  @keyframes hintPulse{
+    0%,100%{
+      opacity:.32;
+    }
+
+    50%{
+      opacity:.72;
+    }
+  }
+
+
+  /* =========================================================
+     CONVERGING PARTICLES
+     ========================================================= */
+
+  .converge-spark{
+    position:absolute;
+    width:4px;
+    height:4px;
+    border-radius:50%;
+    margin:-2px 0 0 -2px;
+
+    background:
+      radial-gradient(
+        circle,
+        #fff 0%,
+        var(--gold) 60%,
+        transparent 100%
+      );
+
+    opacity:0.9;
+    transition:
+      transform .95s cubic-bezier(.22,1,.36,1),
+      opacity .95s ease;
+
+    pointer-events:none;
+  }
+
+
+  /* =========================================================
+     CURSOR TRAIL
+     ========================================================= */
+
+  .cursor-trail{
+    position:absolute;
+    pointer-events:none;
+    opacity:0.55;
+    margin:-3px 0 0 -3px;
+    animation:trailFade .65s ease-out forwards;
+  }
+
+  .cursor-trail.dot{
+    width:5px;
+    height:5px;
+    border-radius:50%;
+
+    background:
+      radial-gradient(
+        circle,
+        #fff 0%,
+        var(--rose) 65%,
+        transparent 100%
+      );
+  }
+
+  .cursor-trail.spark{
+    width:6px;
+    height:6px;
+    border-radius:50%;
+
+    background:
+      radial-gradient(
+        circle,
+        #fff 0%,
+        var(--gold) 60%,
+        transparent 100%
+      );
+  }
+
+  .cursor-trail.heart{
+    width:8px;
+    height:8px;
+  }
+
+  .cursor-trail.heart::before{
+    content:'';
+    position:absolute;
+    inset:0;
+    background:var(--rose-deep);
+    clip-path:path(
+      'M4 7.4C1.6 5.6 0 4 0 2.4 0 1.1 1 0 2.4 0c.9 0 1.6.5 1.6 1.1C4.6.5 5.3 0 6.2 0 7.6 0 8.6 1.1 8.6 2.4 8.6 4 7 5.6 4.6 7.4Z'
+    );
+    opacity:0.8;
+  }
+
+  @keyframes trailFade{
+    0%{
+      opacity:0.6;
+      transform:scale(1);
+    }
+
+    100%{
+      opacity:0;
+      transform:scale(0.4) translateY(6px);
+    }
+  }
+
+
+  /* =========================================================
+     TYPOGRAPHY
+     ========================================================= */
+
+  .eyebrow{
+    font-size:0.92rem;
+    letter-spacing:0.05em;
+    color:var(--plum-soft);
+    margin-bottom:10px;
+  }
+
+  .eyebrow.light{
+    color:#e7d3d3;
+  }
+
+  .headline{
+    font-family:'Fraunces', serif;
+    font-weight:400;
+    font-size:clamp(2.3rem, 7.6vw, 4.6rem);
+    line-height:1.03;
+    letter-spacing:-0.01em;
+  }
+
+  /*
+    IMPORTANT:
+    This pink remains #c67f92 in both light and dark OS modes.
+  */
+
+  .name-line{
+    margin-top:4px;
+    font-family:'Fraunces', serif;
+    font-style:italic;
+    font-weight:500;
+    font-size:clamp(2.8rem, 9.5vw, 6rem);
+
+    color:#c67f92;
+
+    text-shadow:
+      0 0 40px rgba(226,163,179,0.35);
+  }
+
+  .subline{
+    margin-top:20px;
+    font-size:1.02rem;
+    color:var(--plum-soft);
+  }
+
+  .micro{
+    margin-top:22px;
+    font-size:0.78rem;
+    letter-spacing:0.1em;
+    color:var(--plum-soft);
+    opacity:0.85;
+  }
+
+
+  /* =========================================================
+     WISH TEXT
+     ========================================================= */
+
+  .wish-kicker{
+    font-size:1rem;
+    color:#c67f92;
+    font-family:'Fraunces', serif;
+    font-style:italic;
+    margin-bottom:12px;
+  }
+
+  .wish-text{
+    font-family:'Fraunces', serif;
+    font-weight:400;
+    font-size:clamp(1.3rem, 3.2vw, 2.1rem);
+    line-height:1.35;
+  }
+
+  .wish-text.small{
+    margin-top:20px;
+    font-size:clamp(1.05rem, 2.2vw, 1.4rem);
+    color:var(--plum-soft);
+    font-style:italic;
+  }
+
+  .stroke-heart{
+    width:46px;
+    height:40px;
+    margin:0 auto 18px;
+    opacity:0.75;
+  }
+
+  .stroke-heart path{
+    fill:none;
+    stroke:#c67f92;
+    stroke-width:1.4;
+    stroke-linecap:round;
+    stroke-dasharray:140;
+    stroke-dashoffset:140;
+    animation:strokeIn 1.4s .2s ease forwards;
+  }
+
+  @keyframes strokeIn{
+    to{
+      stroke-dashoffset:0;
+    }
+  }
+
+
+  /* =========================================================
+     CAKE CAPTION
+     ========================================================= */
+
+  .cake-caption{
+    font-family:'Fraunces', serif;
+    font-weight:400;
+    font-size:clamp(1.25rem, 3vw, 1.9rem);
+    color:#fdf3ef;
+    letter-spacing:0.01em;
+  }
+
+  .cake-sub{
+    margin-top:7px;
+    color:#dcc7c7;
+    font-size:0.82rem;
+    letter-spacing:0.06em;
+  }
+
+  .fade-block.rise{
+    animation:
+      riseIn 1.6s cubic-bezier(.22,1,.36,1) both;
+  }
+
+  @keyframes riseIn{
+    from{
+      opacity:0;
+      transform:translateY(16px) scale(.985);
+    }
+
+    to{
+      opacity:1;
+      transform:translateY(0) scale(1);
+    }
+  }
+
+  .cake-sub.light{
+    color:var(--plum-soft);
+  }
+
+
+  /* =========================================================
+     BUTTONS
+     ========================================================= */
+
+  .btn{
+    font-family:'Manrope', sans-serif;
+    font-weight:600;
+    font-size:0.9rem;
+    letter-spacing:0.01em;
+
+    padding:13px 28px;
+    border-radius:100px;
+    border:none;
+    cursor:pointer;
+
+    background:rgba(255,255,255,0.14);
+    color:#fdf3ef;
+
+    backdrop-filter:blur(14px);
+
+    border:1px solid rgba(255,255,255,0.28);
+
+    box-shadow:
+      0 10px 30px rgba(20,10,14,0.25);
+
+    transition:
+      transform 0.25s ease,
+      box-shadow 0.25s ease,
+      background .25s ease;
+
+    pointer-events:auto;
+  }
+
+  .btn:hover{
+    transform:translateY(-2px);
+    background:rgba(255,255,255,0.22);
+  }
+
+  .btn:active{
+    transform:translateY(0);
+  }
+
+  .btn.solid{
+    background:#c67f92;
+    color:#fff;
+    border:none;
+
+    box-shadow:
+      0 10px 30px rgba(198,127,146,0.4);
+  }
+
+  .btn.solid:hover{
+    background:#b76d80;
+  }
+
+  .btn.dark{
+    background:#3d2b34;
+    color:#fff;
+    border:none;
+  }
+
+
+  /* =========================================================
+     MIC
+     ========================================================= */
+
+  .mic-row{
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    gap:10px;
+    margin:16px 0 18px;
+    pointer-events:auto;
+  }
+
+  .mic-icon{
+    width:36px;
+    height:36px;
+    border-radius:50%;
+    border:1px solid rgba(255,255,255,0.35);
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    position:relative;
+    flex:none;
+    cursor:pointer;
+  }
+
+  .mic-icon .ring{
+    position:absolute;
+    inset:-6px;
+    border-radius:50%;
+    border:1px solid #e2a3b3;
+    opacity:0;
+    transform:scale(0.8);
+  }
+
+  .mic-icon.active .ring{
+    animation:micPulse 1.1s ease-out infinite;
+  }
+
+  @keyframes micPulse{
+    0%{
+      opacity:0.7;
+      transform:scale(0.8);
+    }
+
+    100%{
+      opacity:0;
+      transform:scale(1.6);
+    }
+  }
+
+  .mic-hint{
+    font-size:0.85rem;
+    color:#dcc7c7;
+    text-align:left;
+  }
+
+
+  /* =========================================================
+     CUT GUIDE
+     ========================================================= */
+
+  .cut-guide{
+    position:absolute;
+    left:50%;
+    top:30%;
+    bottom:30%;
+    width:2px;
+    transform:translateX(-50%);
+
+    background:
+      linear-gradient(
+        180deg,
+        transparent,
+        rgba(255,214,180,0.85),
+        transparent
+      );
+
+    box-shadow:
+      0 0 18px 2px rgba(255,196,150,0.5);
+
+    z-index:4;
+    opacity:0;
+    transition:opacity .9s ease;
+    pointer-events:none;
+  }
+
+  .cut-guide.on{
+    opacity:1;
+    animation:guidePulse 1.8s ease-in-out infinite;
+  }
+
+  .cut-guide.fading{
+    opacity:0;
+  }
+
+  @keyframes guidePulse{
+    0%,100%{
+      opacity:.55;
+    }
+
+    50%{
+      opacity:1;
+    }
+  }
+
+
+  /* =========================================================
+     CELEBRATION
+     ========================================================= */
+
+  .celebration-title{
+    font-family:'Fraunces', serif;
+    font-weight:400;
+    font-size:clamp(2.1rem, 6.6vw, 4rem);
+
+    /*
+      Hard-coded exact pink.
+    */
+    color:#c67f92;
+  }
+
+  .celebration-sub{
+    margin-top:16px;
+    max-width:520px;
+    font-size:1.02rem;
+    color:var(--plum-soft);
+    line-height:1.6;
+    margin-left:auto;
+    margin-right:auto;
+  }
+
+
+  /* =========================================================
+     MUSIC TOGGLE
+     ========================================================= */
+
+  #music-toggle{
+    position:fixed;
+    top:calc(18px + env(safe-area-inset-top));
+    right:calc(18px + env(safe-area-inset-right));
+    z-index:60;
+
+    width:44px;
+    height:44px;
+    border-radius:50%;
+
+    background:rgba(255,255,255,0.55);
+
+    backdrop-filter:blur(10px);
+
+    border:1px solid rgba(255,255,255,0.7);
+
+    display:flex;
+    align-items:center;
+    justify-content:center;
+
+    cursor:pointer;
+
+    box-shadow:
+      0 8px 24px rgba(198,127,146,0.2);
+
+    transition:
+      transform 0.25s ease;
+
+    /*
+      Don't let browser recolor this control.
+    */
+    color-scheme:only light;
+    forced-color-adjust:none;
+  }
+
+  #music-toggle:hover{
+    transform:scale(1.06);
+  }
+
+  #music-toggle svg{
+    width:18px;
+    height:18px;
+  }
+
+  #music-toggle .bar{
+    transform-origin:bottom;
+    transition:transform .2s ease;
+  }
+
+  #music-toggle.playing .bar{
+    animation:bar 0.9s ease-in-out infinite alternate;
+  }
+
+  #music-toggle .bar:nth-child(2){
+    animation-delay:0.15s;
+  }
+
+  #music-toggle .bar:nth-child(3){
+    animation-delay:0.3s;
+  }
+
+  @keyframes bar{
+    from{
+      transform:scaleY(0.3);
+    }
+
+    to{
+      transform:scaleY(1);
+    }
+  }
+
+
+  /* =========================================================
+     MUSIC FALLBACK
+     ========================================================= */
+
+  #music-fallback{
+    position:fixed;
+    bottom:calc(28px + env(safe-area-inset-bottom));
+    left:50%;
+    transform:translateX(-50%) translateY(12px);
+
+    z-index:60;
+
+    width:46px;
+    height:46px;
+    border-radius:50%;
+
+    background:rgba(255,255,255,0.72);
+
+    backdrop-filter:blur(12px);
+
+    border:1px solid rgba(255,255,255,0.85);
+
+    box-shadow:
+      0 8px 28px rgba(198,127,146,0.22);
+
+    display:flex;
+    align-items:center;
+    justify-content:center;
+
+    opacity:0;
+    pointer-events:none;
+
+    transition:
+      opacity .5s ease,
+      transform .5s cubic-bezier(.22,1,.36,1);
+
+    cursor:pointer;
+
+    color-scheme:only light;
+    forced-color-adjust:none;
+  }
+
+  #music-fallback.show{
+    opacity:1;
+    pointer-events:auto;
+    transform:translateX(-50%) translateY(0);
+  }
+
+  #music-fallback.hiding{
+    opacity:0;
+    transform:translateX(-50%) translateY(10px);
+    pointer-events:none;
+  }
+
+  #music-fallback svg{
+    width:20px;
+    height:20px;
+
+    /*
+      Exact original pink.
+    */
+    fill:#c67f92;
+  }
+
+  #music-fallback.pulse svg{
+    animation:notePulse 1.8s ease-in-out infinite;
+  }
+
+  @keyframes notePulse{
+    0%,100%{
+      transform:scale(1);
+      opacity:0.85;
+    }
+
+    50%{
+      transform:scale(1.12);
+      opacity:1;
+    }
+  }
+
+
+  /* =========================================================
+     CUSTOM CURSOR
+     ========================================================= */
+
+  #cursor-dot{
+    position:fixed;
+    top:0;
+    left:0;
+
+    width:8px;
+    height:8px;
+    border-radius:50%;
+
+    background:#c67f92;
+
+    pointer-events:none;
+    z-index:70;
+
+    transform:translate(-50%,-50%);
+
+    transition:
+      width .2s ease,
+      height .2s ease,
+      background .2s ease;
+
+    opacity:0;
+  }
+
+  #cursor-dot.show{
+    opacity:0.85;
+  }
+
+  #cursor-dot.expand{
+    width:30px;
+    height:30px;
+    background:transparent;
+    border:1.5px solid #c67f92;
+  }
+
+  @media (hover:none), (pointer:coarse){
+    #cursor-dot{
+      display:none;
+    }
+  }
+
+
+  /* =========================================================
+     SPARKLES
+     ========================================================= */
+
+  .sparkle{
+    position:absolute;
+    width:5px;
+    height:5px;
+    border-radius:50%;
+    pointer-events:none;
+
+    background:
+      radial-gradient(
+        circle,
+        #fff 0%,
+        var(--gold) 60%,
+        transparent 100%
+      );
+
+    animation:sparkleFx .9s ease-out forwards;
+  }
+
+  @keyframes sparkleFx{
+    0%{
+      transform:scale(0) translateY(0);
+      opacity:0;
+    }
+
+    25%{
+      opacity:1;
+    }
+
+    100%{
+      transform:scale(1.3) translateY(-16px);
+      opacity:0;
+    }
+  }
+
+
+  /* =========================================================
+     PETALS
+     ========================================================= */
+
+  .petal{
+    position:absolute;
+    border-radius:60% 0 60% 0;
+    pointer-events:none;
+
+    background:
+      linear-gradient(
+        135deg,
+        #e2a3b3,
+        #f6dfe4
+      );
+
+    opacity:0.5;
+  }
+
+  @keyframes petalFloat{
+    0%,100%{
+      transform:translateY(0) rotate(0deg);
+    }
+
+    50%{
+      transform:translateY(-22px) rotate(18deg);
+    }
+  }
+
+
+  /* =========================================================
+     ACCESSIBILITY
+     ========================================================= */
+
+  .sr-only{
+    position:absolute;
+    width:1px;
+    height:1px;
+    overflow:hidden;
+    clip:rect(0 0 0 0);
+  }
+
+
+  /* =========================================================
+     MOBILE
+     ========================================================= */
+
+  @media (max-width:640px){
+
+    #text-top{
+      top:2.2vh;
+    }
+
+    #text-bottom{
+      bottom:5vh;
+    }
+
+    .cake-glow{
+      width:92vw;
+      height:92vw;
+    }
+  }
+</style>
+</head>
+<body>
+
+<div id="app">
+  <div id="bg-stack">
+    <div class="bg-layer bg-intro active"></div>
+    <div class="bg-layer bg-wish"></div>
+    <div class="bg-layer bg-cake"></div>
+    <div class="bg-layer bg-candles"></div>
+    <div class="bg-layer bg-cut"></div>
+    <div class="bg-layer bg-celebration"></div>
+  </div>
+  <div id="vignette"></div>
+  <div class="cake-glow" id="cake-glow"></div>
+  <div id="intro-glow"></div>
+
+  <canvas id="particle-canvas"></canvas>
+  <div id="cake-canvas-wrap"></div>
+  <div class="cut-guide" id="cut-guide"></div>
+  <div id="fx-layer"></div>
+  <div id="flash"></div>
+
+  <div id="text-top"></div>
+  <div id="text-center"></div>
+  <div id="text-bottom"></div>
+</div>
+
+<canvas id="confetti-canvas"></canvas>
+<div id="cursor-dot"></div>
+
+<button id="music-toggle" aria-label="Toggle music" title="Music">
+  <svg viewBox="0 0 24 24" fill="none">
+    <rect class="bar" x="4" y="10" width="3" height="8" rx="1.5" fill="#c67f92"/>
+    <rect class="bar" x="10.5" y="6" width="3" height="12" rx="1.5" fill="#c67f92"/>
+    <rect class="bar" x="17" y="12" width="3" height="6" rx="1.5" fill="#c67f92"/>
+  </svg>
+</button>
+
+<div id="music-fallback" aria-label="Play music" title="Play music">
+  <svg viewBox="0 0 24 24" fill="none">
+    <path d="M9 18V5l12-2v13" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="6" cy="18" r="3" fill="currentColor"/>
+    <circle cx="18" cy="16" r="3" fill="currentColor"/>
+  </svg>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from "three";
+
+/* ============================================================
+   EDITABLE CONTENT — change names / wishes / music here
+   ============================================================ */
+const CONTENT = {
+  name: "Fatima",
+  eyebrow: "A little something for",
+  subline: "Today is all about you.",
+  wishKicker: "To the sweetest person I know,",
+  wish1: "May your life always find its way to the kind of happiness your heart quietly deserves🌷",
+  wish2: "You deserve a year as wonderful as you are. ♡",
+  celebrationSub: "Here's to another beautiful year of laughter, happiness and unforgettable memories. ♡",
+};
+
+let currentBg = 'intro';
+let state = null;
+
+
+const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+const isMobile = window.matchMedia('(max-width: 640px)').matches;
+const isTouch = window.matchMedia('(hover:none), (pointer:coarse)').matches;
+
+/* ============================================================
+   -1. Lightweight synthesized sound design (chime / whoosh / slice)
+   No extra audio assets are required — everything here is generated
+   with the Web Audio API so the page never breaks if a file is
+   missing. Nothing plays until the visitor's first gesture, in line
+   with browser autoplay policy.
+   ============================================================ */
+let sfxCtx = null;
+function getSfxCtx(){
+  if(sfxCtx) return sfxCtx;
+  try{ sfxCtx = new (window.AudioContext || window.webkitAudioContext)(); }
+  catch(err){ sfxCtx = null; }
+  return sfxCtx;
+}
+function sfxReady(){
+  const ctx = getSfxCtx();
+  return ctx && ctx.state === 'running';
+}
+function playChime(){
+  if(!sfxReady()) return;
+  try{
+    const ctx = sfxCtx;
+    const notes = [1318.5, 1760]; // soft high two-note chime
+    notes.forEach((freq, i)=>{
+      const t0 = ctx.currentTime + i*0.14;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(0, t0);
+      gain.gain.linearRampToValueAtTime(0.05, t0 + 0.05);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 1.1);
+      osc.connect(gain).connect(ctx.destination);
+      osc.start(t0);
+      osc.stop(t0 + 1.2);
+    });
+  }catch(err){}
+}
+function playWhoosh(){
+  if(!sfxReady()) return;
+  try{
+    const ctx = sfxCtx;
+    const dur = 0.9;
+    const bufferSize = Math.floor(ctx.sampleRate * dur);
+    const buffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
+    const data = buffer.getChannelData(0);
+    for(let i=0;i<bufferSize;i++){ data[i] = (Math.random()*2-1) * (1 - i/bufferSize); }
+    const noise = ctx.createBufferSource();
+    noise.buffer = buffer;
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'bandpass';
+    filter.Q.value = 0.7;
+    filter.frequency.setValueAtTime(180, ctx.currentTime);
+    filter.frequency.exponentialRampToValueAtTime(1400, ctx.currentTime + dur*0.6);
+    filter.frequency.exponentialRampToValueAtTime(220, ctx.currentTime + dur);
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(0, ctx.currentTime);
+    gain.gain.linearRampToValueAtTime(0.09, ctx.currentTime + dur*0.3);
+    gain.gain.linearRampToValueAtTime(0, ctx.currentTime + dur);
+    noise.connect(filter).connect(gain).connect(ctx.destination);
+    noise.start();
+    noise.stop(ctx.currentTime + dur);
+  }catch(err){}
+}
+function playSlice(){
+  if(!sfxReady()) return;
+  try{
+    const ctx = sfxCtx;
+    const dur = 0.32;
+    const bufferSize = Math.floor(ctx.sampleRate * dur);
+    const buffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
+    const data = buffer.getChannelData(0);
+    for(let i=0;i<bufferSize;i++){ data[i] = (Math.random()*2-1) * Math.pow(1 - i/bufferSize, 2); }
+    const noise = ctx.createBufferSource();
+    noise.buffer = buffer;
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'highpass';
+    filter.frequency.value = 2200;
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(0.07, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + dur);
+    noise.connect(filter).connect(gain).connect(ctx.destination);
+    noise.start();
+    noise.stop(ctx.currentTime + dur);
+  }catch(err){}
+}
+
+/* ============================================================
+   0. Ambient particle canvas (hearts + sparkles + bokeh)
+   ============================================================ */
+const pCanvas = document.getElementById('particle-canvas');
+const pCtx = pCanvas.getContext('2d');
+let pw, ph, particles = [];
+function resizeParticles(){
+  pw = pCanvas.width = pCanvas.clientWidth * (window.devicePixelRatio || 1);
+  ph = pCanvas.height = pCanvas.clientHeight * (window.devicePixelRatio || 1);
+}
+function initParticles(){
+  resizeParticles();
+  const COUNT = reduceMotion ? 0 : (isMobile ? 10 : 20);
+  particles = [];
+  for(let i=0;i<COUNT;i++){
+    particles.push({
+      x: Math.random()*pw, y: Math.random()*ph + ph,
+      r: (Math.random()*2.2 + 0.8) * (window.devicePixelRatio||1),
+      speed: (Math.random()*0.3 + 0.12) * (window.devicePixelRatio||1),
+      drift: Math.random()*0.6 - 0.3,
+      isHeart: Math.random() > 0.8,
+      opacity: Math.random()*0.3 + 0.12,
+      angle: Math.random()*Math.PI*2
+    });
+  }
+}
+function drawHeart(x,y,size,opacity,color){
+  pCtx.save();
+  pCtx.translate(x,y);
+  pCtx.scale(size/10, size/10);
+  pCtx.beginPath();
+  pCtx.moveTo(0,3);
+  pCtx.bezierCurveTo(0,0,-5,0,-5,3);
+  pCtx.bezierCurveTo(-5,6,0,8,0,10);
+  pCtx.bezierCurveTo(0,8,5,6,5,3);
+  pCtx.bezierCurveTo(5,0,0,0,0,3);
+  pCtx.fillStyle = `rgba(${color},${opacity})`;
+  pCtx.fill();
+  pCtx.restore();
+}
+function tickParticles(){
+  pCtx.clearRect(0,0,pw,ph);
+  const isDark = ['cake','candles','cut'].includes(currentBg);
+  const heartColor = isDark ? '255,214,214' : '226,163,179';
+  const dustColor = isDark ? '255,225,190' : '255,255,255';
+  for(const p of particles){
+    p.y -= p.speed;
+    p.x += Math.sin(p.angle + p.y*0.01) * p.drift * 0.3;
+    if(p.y < -20){ p.y = ph + 20; p.x = Math.random()*pw; }
+    if(p.isHeart) drawHeart(p.x, p.y, p.r*3, p.opacity, heartColor);
+    else{
+      pCtx.beginPath();
+      pCtx.arc(p.x, p.y, p.r, 0, Math.PI*2);
+      pCtx.fillStyle = `rgba(${dustColor},${p.opacity})`;
+      pCtx.fill();
+    }
+  }
+  requestAnimationFrame(tickParticles);
+}
+initParticles();
+window.addEventListener('resize', resizeParticles);
+if(!reduceMotion) tickParticles();
+
+/* ============================================================
+   1. Petals (intro only)
+   ============================================================ */
+function spawnPetals(){
+  if(reduceMotion) return;
+  const app = document.getElementById('app');
+  const n = isMobile ? 4 : 8;
+  const holder = document.createElement('div');
+  holder.id = 'petal-holder';
+  holder.style.cssText = 'position:absolute;inset:0;z-index:2;pointer-events:none;';
+  for(let i=0;i<n;i++){
+    const el = document.createElement('div');
+    el.className = 'petal';
+    const size = 6 + Math.random()*10;
+    el.style.width = size+'px';
+    el.style.height = size+'px';
+    el.style.left = (Math.random()*100)+'%';
+    el.style.top = (Math.random()*100)+'%';
+    el.style.animation = `petalFloat ${8+Math.random()*6}s ease-in-out ${Math.random()*4}s infinite`;
+    holder.appendChild(el);
+  }
+  app.appendChild(holder);
+}
+
+/* ============================================================
+   2. DOM sparkle bursts (for text reveals + candle/cut moments)
+   ============================================================ */
+const fxLayer = document.getElementById('fx-layer');
+function spawnSparkles(xFrac, yFrac, count=6, spreadPx=90){
+  if(reduceMotion) return;
+  const w = window.innerWidth, h = window.innerHeight;
+  for(let i=0;i<count;i++){
+    const s = document.createElement('div');
+    s.className = 'sparkle';
+    const x = w*xFrac + (Math.random()-0.5)*spreadPx;
+    const y = h*yFrac + (Math.random()-0.5)*spreadPx*0.5;
+    s.style.left = x+'px';
+    s.style.top = y+'px';
+    s.style.animationDelay = (Math.random()*0.3)+'s';
+    fxLayer.appendChild(s);
+    setTimeout(()=>s.remove(), 1300);
+  }
+}
+function sparkleAroundEl(el, count=7){
+  if(reduceMotion || !el) return;
+  const r = el.getBoundingClientRect();
+  const w = window.innerWidth, h = window.innerHeight;
+  spawnSparkles((r.left+r.right)/2/w, (r.top+r.bottom)/2/h, count, Math.max(r.width*0.6, 80));
+}
+
+/* Tiny particles gathering toward the center — used right before the
+   cake emerges, so the reveal feels drawn together rather than sudden. */
+function spawnConvergingParticles(){
+  if(reduceMotion) return;
+  const n = isMobile ? 8 : 14;
+  const cx = window.innerWidth/2, cy = window.innerHeight*0.52;
+  for(let i=0;i<n;i++){
+    const ang = Math.random()*Math.PI*2;
+    const dist = 150 + Math.random()*220;
+    const sx = cx + Math.cos(ang)*dist, sy = cy + Math.sin(ang)*dist;
+    const el = document.createElement('div');
+    el.className = 'converge-spark';
+    el.style.left = sx+'px';
+    el.style.top = sy+'px';
+    fxLayer.appendChild(el);
+    requestAnimationFrame(()=>requestAnimationFrame(()=>{
+      el.style.transform = `translate(${cx-sx}px, ${cy-sy}px) scale(0.25)`;
+      el.style.opacity = '0';
+    }));
+    setTimeout(()=>el.remove(), 1000);
+  }
+}
+
+/* ============================================================
+   3. Custom cursor (desktop) — sparkle/dot/heart trail
+      On mobile we skip the cursor entirely and use occasional
+      floating sparkles instead.
+   ============================================================ */
+const cursorTrailEls = [];
+function spawnCursorTrailParticle(x, y){
+  if(cursorTrailEls.length > 16) return; // cap DOM nodes, reuse via natural expiry
+  const roll = Math.random();
+  const kind = roll < 0.55 ? 'dot' : (roll < 0.85 ? 'spark' : 'heart');
+  const el = document.createElement('div');
+  el.className = 'cursor-trail ' + kind;
+  el.style.left = x + 'px';
+  el.style.top = y + 'px';
+  fxLayer.appendChild(el);
+  cursorTrailEls.push(el);
+  setTimeout(()=>{ el.remove(); const i = cursorTrailEls.indexOf(el); if(i>-1) cursorTrailEls.splice(i,1); }, 680);
+}
+if(!isTouch){
+  const dot = document.getElementById('cursor-dot');
+  let shown = false;
+  let lastTrailAt = 0;
+  window.addEventListener('mousemove', (e)=>{
+    if(!shown){ dot.classList.add('show'); shown = true; }
+    dot.style.left = e.clientX+'px';
+    dot.style.top = e.clientY+'px';
+    if(!reduceMotion){
+      const now = performance.now();
+      // Throttled so the trail stays lightweight and automatically
+      // stops the instant the cursor stops moving.
+      if(now - lastTrailAt > 65){
+        lastTrailAt = now;
+        spawnCursorTrailParticle(e.clientX, e.clientY);
+      }
+    }
+  });
+  document.addEventListener('mouseover', (e)=>{
+    if(e.target.closest('.btn, .mic-icon, #music-toggle')) dot.classList.add('expand');
+  });
+  document.addEventListener('mouseout', (e)=>{
+    if(e.target.closest('.btn, .mic-icon, #music-toggle')) dot.classList.remove('expand');
+  });
+} else if(!reduceMotion){
+  // Mobile: no cursor, so drift in a lone ambient sparkle every few seconds.
+  function scheduleMobileSparkle(){
+    const delay = 3200 + Math.random()*2400;
+    setTimeout(()=>{
+      spawnSparkles(0.15 + Math.random()*0.7, 0.18 + Math.random()*0.55, 1, 20);
+      scheduleMobileSparkle();
+    }, delay);
+  }
+  scheduleMobileSparkle();
+}
+
+/* ============================================================
+   4. THREE.JS CAKE SCENE
+   ============================================================ */
+const wrap = document.getElementById('cake-canvas-wrap');
+let scene, camera, renderer;
+let cakeGroup, candleFlames = [], knifeGroup, dustPoints;
+const clock = new THREE.Clock();
+let renderScale = isMobile ? Math.min(window.devicePixelRatio||1, 1.5) : Math.min(window.devicePixelRatio||1, 2);
+let sceneReady = false;
+let camBase = new THREE.Vector3(0, 2.1, 7.2);
+let camWanted = new THREE.Vector3(0, 2.1, 7.2);
+let shakeUntil = 0, shakeMag = 0;
+let candleIgniteMul = 0; // 0→1 ramp so the candles gradually illuminate on reveal
+
+function initScene(){
+  scene = new THREE.Scene();
+  scene.fog = new THREE.Fog(0x1c1319, 8, 20);
+
+  camera = new THREE.PerspectiveCamera(38, wrap.clientWidth/wrap.clientHeight, 0.1, 100);
+  camera.position.copy(camBase);
+
+
+  renderer = new THREE.WebGLRenderer({ antialias:true, alpha:true, powerPreference:'high-performance' });
+  renderer.setSize(wrap.clientWidth, wrap.clientHeight);
+  renderer.setPixelRatio(renderScale);
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.05;
+  renderer.shadowMap.enabled = !isMobile;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  wrap.appendChild(renderer.domElement);
+
+  const key = new THREE.SpotLight(0xffe4e9, 0, 20, Math.PI/5, 0.5, 1.2);
+  key.position.set(3.2, 6, 4);
+  key.castShadow = !isMobile;
+  if(!isMobile){ key.shadow.mapSize.set(1024,1024); key.shadow.bias = -0.0015; }
+  scene.add(key);
+
+  const rim = new THREE.PointLight(0xd8b98a, 0, 12, 2);
+  rim.position.set(-3, 3.4, -3);
+  scene.add(rim);
+
+  const fill = new THREE.PointLight(0xffc9d6, 0, 10, 2);
+  fill.position.set(-2, 1.2, 3.5);
+  scene.add(fill);
+
+  const amb = new THREE.AmbientLight(0x40282e, 0);
+  scene.add(amb);
+
+  const groundGeo = new THREE.CircleGeometry(6, 40);
+  const groundMat = new THREE.ShadowMaterial({ opacity: 0.35 });
+  const ground = new THREE.Mesh(groundGeo, groundMat);
+  ground.rotation.x = -Math.PI/2;
+  ground.position.y = -1.02;
+  ground.receiveShadow = !isMobile;
+  scene.add(ground);
+
+  scene.userData.lights = { key, rim, fill, amb };
+
+  buildCake();
+  buildKnife();
+  buildDust();
+
+  window.addEventListener('resize', onResize);
+  sceneReady = true;
+  animate();
+}
+
+function revealLights(){
+  const { key, rim, fill, amb } = scene.userData.lights;
+  animateVal(0, 55, 1800, v=>key.intensity=v);
+  animateVal(0, 18, 1800, v=>rim.intensity=v);
+  animateVal(0, 8, 1800, v=>fill.intensity=v);
+  animateVal(0, 1.1, 1800, v=>amb.intensity=v);
+}
+function animateVal(from, to, dur, cb){
+  const t0 = performance.now();
+  function step(now){
+    const t = Math.min(1, (now-t0)/dur);
+    const e = 1 - Math.pow(1-t, 3);
+    cb(from + (to-from)*e);
+    if(t < 1) requestAnimationFrame(step);
+  }
+  requestAnimationFrame(step);
+}
+
+function roundedCylinder(rTop, rBottom, height, segments=isMobile?28:48){
+  return new THREE.CylinderGeometry(rTop, rBottom, height, segments, 1, false);
+}
+
+function buildCake(){
+  cakeGroup = new THREE.Group();
+  cakeGroup.position.y = -0.55;
+
+  const plateMat = new THREE.MeshPhysicalMaterial({ color:0xfaf1ec, roughness:0.15, metalness:0.05, clearcoat:0.6, clearcoatRoughness:0.2 });
+  const plate = new THREE.Mesh(new THREE.CylinderGeometry(2.05, 2.15, 0.12, isMobile?32:64), plateMat);
+  plate.position.y = -0.06;
+  plate.receiveShadow = true; plate.castShadow = true;
+  cakeGroup.add(plate);
+
+  const creamMat = new THREE.MeshPhysicalMaterial({ color:0xfff3ea, roughness:0.55, sheen:1, sheenColor:0xffffff });
+  const pinkMat = new THREE.MeshPhysicalMaterial({ color:0xf3b8c6, roughness:0.42, sheen:0.6, sheenColor:0xffe3ea });
+
+  const layer1 = new THREE.Mesh(roundedCylinder(1.55, 1.65, 0.85), pinkMat);
+  layer1.position.y = 0.42; layer1.castShadow = true; layer1.receiveShadow = true;
+  cakeGroup.add(layer1);
+
+  const drip1 = new THREE.Mesh(new THREE.TorusGeometry(1.58, 0.09, 10, isMobile?36:60), creamMat);
+  drip1.rotation.x = Math.PI/2; drip1.position.y = 0.82; drip1.castShadow = true;
+  cakeGroup.add(drip1);
+
+  const layer2 = new THREE.Mesh(roundedCylinder(1.15, 1.22, 0.72), creamMat);
+  layer2.position.y = 1.22; layer2.castShadow = true; layer2.receiveShadow = true;
+  cakeGroup.add(layer2);
+
+  const drip2 = new THREE.Mesh(new THREE.TorusGeometry(1.17, 0.075, 10, isMobile?32:56), pinkMat);
+  drip2.rotation.x = Math.PI/2; drip2.position.y = 1.58; drip2.castShadow = true;
+  cakeGroup.add(drip2);
+
+  const layer3 = new THREE.Mesh(roundedCylinder(0.78, 0.85, 0.6), pinkMat);
+  layer3.position.y = 2.02; layer3.castShadow = true; layer3.receiveShadow = true;
+  cakeGroup.add(layer3);
+
+  const cap = new THREE.Mesh(new THREE.SphereGeometry(0.8, isMobile?20:32, isMobile?12:16, 0, Math.PI*2, 0, Math.PI*0.32), creamMat);
+  cap.position.y = 2.3; cap.castShadow = true;
+  cakeGroup.add(cap);
+
+  const dotMat = new THREE.MeshPhysicalMaterial({ color:0xffffff, roughness:0.4 });
+  function pipeRing(radius, y, count, scale=0.045){
+    for(let i=0;i<count;i++){
+      const a = (i/count)*Math.PI*2;
+      const dot = new THREE.Mesh(new THREE.SphereGeometry(scale, 8, 8), dotMat);
+      dot.position.set(Math.cos(a)*radius, y, Math.sin(a)*radius);
+      dot.castShadow = true;
+      cakeGroup.add(dot);
+    }
+  }
+  pipeRing(1.66, 0.05, isMobile?18:30);
+  pipeRing(1.24, 0.88, isMobile?16:26, 0.04);
+  pipeRing(0.87, 1.6, isMobile?12:20, 0.035);
+
+  const strawberryMat = new THREE.MeshPhysicalMaterial({ color:0xd44b5e, roughness:0.35, clearcoat:0.4 });
+  const leafMat = new THREE.MeshStandardMaterial({ color:0x6f9a5f, roughness:0.6 });
+  function strawberry(radius, y, x, z){
+    const g = new THREE.Group();
+    const body = new THREE.Mesh(new THREE.ConeGeometry(radius, radius*1.5, 10), strawberryMat);
+    body.rotation.x = Math.PI; body.castShadow = true;
+    g.add(body);
+    const leaf = new THREE.Mesh(new THREE.ConeGeometry(radius*0.55, radius*0.4, 6), leafMat);
+    leaf.position.y = radius*0.72;
+    g.add(leaf);
+    g.position.set(x, y, z);
+    cakeGroup.add(g);
+  }
+  const sTop = 2.02 + 0.3;
+  for(let i=0;i<6;i++){
+    const a = (i/6)*Math.PI*2;
+    strawberry(0.11, sTop, Math.cos(a)*0.55, Math.sin(a)*0.55);
+  }
+
+  const sprinkleGeo = new THREE.CapsuleGeometry(0.012, 0.05, 2, 4);
+  const sprinkleColors = [0xffffff, 0xe2a3b3, 0xd8b98a, 0xece3f2];
+  const sprinkleCount = isMobile ? 36 : 70;
+  for(let i=0;i<sprinkleCount;i++){
+    const mat = new THREE.MeshStandardMaterial({ color: sprinkleColors[i % sprinkleColors.length], roughness:0.5 });
+    const m = new THREE.Mesh(sprinkleGeo, mat);
+    const layerChoice = Math.random();
+    let radius, y;
+    if(layerChoice < 0.34){ radius = 1.66; y = 0.05 + Math.random()*0.7; }
+    else if(layerChoice < 0.7){ radius = 1.24; y = 0.9 + Math.random()*0.55; }
+    else { radius = 0.87; y = 1.65 + Math.random()*0.35; }
+    const a = Math.random()*Math.PI*2;
+    m.position.set(Math.cos(a)*radius, y, Math.sin(a)*radius);
+    m.rotation.set(Math.random()*Math.PI, Math.random()*Math.PI, Math.random()*Math.PI);
+    cakeGroup.add(m);
+  }
+
+  const candleMat = new THREE.MeshStandardMaterial({ color:0xfdf6ee, roughness:0.4 });
+  const wickMat = new THREE.MeshStandardMaterial({ color:0x3a2c2c, roughness:0.9 });
+  const candleCount = 5;
+  candleFlames = [];
+  for(let i=0;i<candleCount;i++){
+    const a = (i/candleCount)*Math.PI*2 + 0.3;
+    const cx = Math.cos(a)*0.42, cz = Math.sin(a)*0.42;
+    const candle = new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.03, 0.38, 10), candleMat);
+    candle.position.set(cx, 2.62 + 0.19, cz); candle.castShadow = true;
+    cakeGroup.add(candle);
+
+    const wick = new THREE.Mesh(new THREE.CylinderGeometry(0.006,0.006,0.06,6), wickMat);
+    wick.position.set(cx, 2.62 + 0.4, cz);
+    cakeGroup.add(wick);
+
+    const flameLight = new THREE.PointLight(0xffb347, 0, 1.6, 2);
+    flameLight.position.set(cx, 2.62 + 0.46, cz);
+    cakeGroup.add(flameLight);
+
+    const flameGeo = new THREE.ConeGeometry(0.045, 0.12, 8);
+    const flameMat = new THREE.MeshBasicMaterial({ color:0xffb347, transparent:true, opacity:0.95 });
+    const flame = new THREE.Mesh(flameGeo, flameMat);
+    flame.position.set(cx, 2.62 + 0.47, cz);
+    cakeGroup.add(flame);
+
+    candleFlames.push({
+      mesh: flame, light: flameLight, baseY: 2.62 + 0.47, x: cx, z: cz, lit:true,
+      phase: Math.random()*10, ampMul: 0.7 + Math.random()*0.7, speedMul: 0.8 + Math.random()*0.5
+    });
+  }
+
+  scene.add(cakeGroup);
+  cakeGroup.userData.baseY = cakeGroup.position.y;
+}
+
+function buildDust(){
+  const count = isMobile ? 22 : 46;
+  const geo = new THREE.BufferGeometry();
+  const positions = new Float32Array(count*3);
+  const speeds = new Float32Array(count);
+  for(let i=0;i<count;i++){
+    positions[i*3] = (Math.random()-0.5)*4.5;
+    positions[i*3+1] = Math.random()*3.5 - 0.6;
+    positions[i*3+2] = (Math.random()-0.5)*3.5 + 1;
+    speeds[i] = 0.05 + Math.random()*0.08;
+  }
+  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  const mat = new THREE.PointsMaterial({ color:0xffe3c2, size:0.018, transparent:true, opacity:0, depthWrite:false, blending:THREE.AdditiveBlending });
+  dustPoints = new THREE.Points(geo, mat);
+  dustPoints.userData.speeds = speeds;
+  scene.add(dustPoints);
+}
+
+let knifeState = { revealed:false, dragging:false, progress:0, cutDone:false };
+const knifeStart = { pos:new THREE.Vector3(2.6, 4.6, 1.2), rot:new THREE.Euler(0.3, 0.5, 1.15) };
+const knifeEnd = { pos:new THREE.Vector3(1.25, 2.55, 0.9), rot:new THREE.Euler(0.15, 0.35, Math.PI/2 + 0.1) };
+
+function buildKnife(){
+  knifeGroup = new THREE.Group();
+  const bladeMat = new THREE.MeshPhysicalMaterial({ color:0xe9e9ee, metalness:0.9, roughness:0.15, clearcoat:0.6 });
+  const handleMat = new THREE.MeshPhysicalMaterial({ color:0xf3d9de, roughness:0.4, clearcoat:0.5 });
+  const sparkleMat = new THREE.MeshBasicMaterial({ color:0xffffff, transparent:true, opacity:0.9 });
+
+  const blade = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.05, 1.5), bladeMat);
+  blade.geometry.translate(0,0,-0.75);
+  blade.castShadow = true;
+  knifeGroup.add(blade);
+
+  const edgeGlint = new THREE.Mesh(new THREE.BoxGeometry(0.052, 0.01, 1.4), sparkleMat);
+  edgeGlint.geometry.translate(0,0.026,-0.72);
+  knifeGroup.add(edgeGlint);
+  knifeGroup.userData.glint = edgeGlint;
+
+  const handle = new THREE.Mesh(new THREE.CylinderGeometry(0.06,0.06,0.5,12), handleMat);
+  handle.rotation.x = Math.PI/2; handle.position.z = 0.28; handle.castShadow = true;
+  knifeGroup.add(handle);
+
+  knifeGroup.traverse(o=>{ if(o.isMesh){ o.material.depthTest = false; o.material.depthWrite = false; o.renderOrder = 999; } });
+  knifeGroup.renderOrder = 999;
+  knifeGroup.position.copy(knifeStart.pos);
+  knifeGroup.rotation.copy(knifeStart.rot);
+  knifeGroup.visible = false;
+  scene.add(knifeGroup);
+}
+
+function revealKnife(){
+  if(knifeState.revealed) return;
+  knifeState.revealed = true;
+  knifeGroup.visible = true;
+  knifeGroup.position.copy(knifeStart.pos);
+  knifeGroup.rotation.copy(knifeStart.rot);
+  const dur = reduceMotion ? 1 : 1400;
+  const t0 = performance.now();
+  function step(now){
+    const t = Math.min(1, (now - t0)/dur);
+    const e = 1 - Math.pow(1-t, 3);
+    knifeGroup.position.lerpVectors(knifeStart.pos, knifeEnd.pos, e);
+    knifeGroup.rotation.x = THREE.MathUtils.lerp(knifeStart.rot.x, knifeEnd.rot.x, e);
+    knifeGroup.rotation.y = THREE.MathUtils.lerp(knifeStart.rot.y, knifeEnd.rot.y, e);
+    knifeGroup.rotation.z = THREE.MathUtils.lerp(knifeStart.rot.z, knifeEnd.rot.z, e);
+    knifeTarget.copy(knifeGroup.position);
+    if(t < 1) requestAnimationFrame(step);
+  }
+  requestAnimationFrame(step);
+}
+
+let clipL, clipR;
+function prepareCutHalves(){
+  clipL = new THREE.Plane(new THREE.Vector3(1,0,0), 0.002);
+  clipR = new THREE.Plane(new THREE.Vector3(-1,0,0), 0.002);
+  cakeGroup.traverse(obj=>{
+    if(obj.isMesh){ obj.material = obj.material.clone(); obj.material.clippingPlanes = []; }
+  });
+  renderer.localClippingEnabled = true;
+}
+function resetClip(){
+  cakeGroup.traverse(obj=>{ if(obj.isMesh) obj.material.clippingPlanes = []; });
+  cakeGroup.position.y = cakeGroup.userData.baseY;
+}
+function performCut(progress){
+  const gap = progress * 0.18;
+
+  // Keep the left half to the left of -gap and the right half to the
+  // right of +gap. The previous version only assigned clipR and could
+  // make most of the cake disappear as soon as the cut started.
+  clipL.constant = -gap;
+  clipR.constant = -gap;
+
+  cakeGroup.traverse(obj=>{
+    if(!obj.isMesh) return;
+
+    // Only the actual cake meshes are split. Decorative objects stay
+    // visible so the cake still reads correctly during the cut.
+    const x = obj.position.x;
+    if(x < -0.02){
+      obj.material.clippingPlanes = [clipR]; // x <= -gap
+    } else if(x > 0.02){
+      obj.material.clippingPlanes = [clipL]; // x >= +gap
+    } else {
+      obj.material.clippingPlanes = [];
+    }
+  });
+
+  cakeGroup.position.y = cakeGroup.userData.baseY - progress*0.03;
+}
+
+let knifeTarget = new THREE.Vector3().copy(knifeEnd.pos);
+const dragPlane = new THREE.Plane(new THREE.Vector3(0,0,1), -0.9);
+const rayc = new THREE.Raycaster();
+const ndc = new THREE.Vector2();
+const hitPoint = new THREE.Vector3();
+
+function pointerToWorld(e){
+  const rect = renderer.domElement.getBoundingClientRect();
+  const cx = (e.touches ? e.touches[0].clientX : e.clientX);
+  const cy = (e.touches ? e.touches[0].clientY : e.clientY);
+  ndc.x = ((cx - rect.left)/rect.width)*2 - 1;
+  ndc.y = -((cy - rect.top)/rect.height)*2 + 1;
+  rayc.setFromCamera(ndc, camera);
+  return rayc.ray.intersectPlane(dragPlane, hitPoint) ? hitPoint : null;
+}
+
+const CUT_TOP = 2.55, CUT_BOTTOM = 0.95;
+
+function setupCutDrag(){
+  function pointerDown(e){
+    if(!knifeState.revealed || knifeState.cutDone) return;
+
+    // Don't let clicks on the music/control UI accidentally start a cut.
+    if(e.target !== renderer.domElement) return;
+
+    knifeState.dragging = true;
+    if(state === 'KNIFE_READY'){
+      // Unlock the persistent audio element silently, synchronously inside
+      // this pointer gesture. This satisfies autoplay policy without
+      // making any music audible yet — see the Music section below.
+      unlockMusicFromGesture();
+      setState('CUTTING');
+      playSlice();
+    }
+    hideCutGuide();
+    pointerMove(e);
+  }
+  function pointerMove(e){
+    if(!knifeState.dragging || knifeState.cutDone) return;
+    const pt = pointerToWorld(e);
+    if(!pt) return;
+    const y = THREE.MathUtils.clamp(pt.y, CUT_BOTTOM, CUT_TOP);
+    const x = THREE.MathUtils.clamp(pt.x, 0.55, 1.9);
+    knifeTarget.set(x, y, 0.9);
+    const progress = THREE.MathUtils.clamp((CUT_TOP - y)/(CUT_TOP - CUT_BOTTOM), 0, 1);
+    if(progress > knifeState.progress){
+      if(Math.random() < 0.5) spawnCrumb(1.5 - progress*1.1, progress);
+    }
+    knifeState.progress = progress;
+    performCut(progress);
+    if(progress > 0.9){ knifeState.dragging = false; completeCut(); }
+  }
+  function pointerUp(){ knifeState.dragging = false; }
+  window.addEventListener('pointerdown', pointerDown, { passive:true });
+  window.addEventListener('pointermove', pointerMove, { passive:true });
+  window.addEventListener('pointerup', pointerUp, { passive:true });
+  window.addEventListener('pointercancel', pointerUp, { passive:true });
+}
+
+function spawnCrumb(y, progress){
+  const geo = new THREE.SphereGeometry(0.012 + Math.random()*0.01, 5, 5);
+  const mat = new THREE.MeshStandardMaterial({ color: Math.random()>0.5?0xf3b8c6:0xfff3ea, roughness:0.6 });
+  const m = new THREE.Mesh(geo, mat);
+  m.position.set((Math.random()-0.5)*0.25, y + (Math.random()-0.5)*0.2, 0.6 + Math.random()*0.4);
+  scene.add(m);
+  const vel = new THREE.Vector3((Math.random()-0.5)*0.6, Math.random()*0.5, (Math.random()-0.5)*0.4);
+  const start = performance.now();
+  (function loop(){
+    const t = (performance.now()-start)/1000;
+    if(t > 1){ scene.remove(m); return; }
+    m.position.addScaledVector(vel, 0.016);
+    vel.y -= 0.025;
+    m.material.opacity = 1;
+    requestAnimationFrame(loop);
+  })();
+}
+
+function completeCut(){
+  if(knifeState.cutDone) return;
+  knifeState.cutDone = true;
+  triggerShake(320, 0.05);
+  spawnCakeSparkleBurst();
+  setTimeout(()=>{ setState('CELEBRATION'); }, 480);
+}
+
+function spawnCakeSparkleBurst(){
+  const sparkleGeo = new THREE.SphereGeometry(0.02, 6, 6);
+  const count = isMobile ? 14 : 24;
+  for(let i=0;i<count;i++){
+    const mat = new THREE.MeshBasicMaterial({ color: 0xffe3ea, transparent:true, opacity:1 });
+    const m = new THREE.Mesh(sparkleGeo, mat);
+    m.position.set((Math.random()-0.5)*0.4, 1.4 + Math.random()*0.6, (Math.random()-0.5)*0.4);
+    scene.add(m);
+    const vel = new THREE.Vector3((Math.random()-0.5)*1.6, Math.random()*1.8+0.6, (Math.random()-0.5)*1.6);
+    const start = performance.now();
+    (function loop(){
+      const t = (performance.now()-start)/1000;
+      if(t > 1.2){ scene.remove(m); return; }
+      m.position.addScaledVector(vel, 0.016);
+      vel.y -= 0.03;
+      m.material.opacity = 1 - t/1.2;
+      requestAnimationFrame(loop);
+    })();
+  }
+  spawnSparkles(0.5, 0.55, 10, 200);
+}
+
+/* ---- candle blow ---- */
+let candlesLit = true;
+function blowOutCandles(){
+  if(!candlesLit) return;
+  candlesLit = false;
+  triggerShake(500, 0.035);
+  flashScreen();
+  spawnSparkles(0.5, 0.42, 10, 240);
+  setTimeout(playChime, 550);
+  candleFlames.forEach((f, i)=>{
+    setTimeout(()=>{
+      const t0 = performance.now();
+      const dur = 500;
+      function step(now){
+        const t = Math.min(1, (now-t0)/dur);
+        f.mesh.scale.setScalar(1-t);
+        f.mesh.position.x = f.x + Math.sin(t*10)*0.03*(1-t);
+        f.light.intensity = 1.3*(1-t);
+        if(t<1) requestAnimationFrame(step);
+        else { f.mesh.visible = false; f.lit = false; spawnSmoke(f.x, f.baseY, f.z); }
+      }
+      requestAnimationFrame(step);
+    }, i*90);
+  });
+}
+function relightCandles(){
+  candlesLit = true;
+  candleIgniteMul = 0; // re-arm the gradual illumination for the next reveal
+  candleFlames.forEach(f=>{ f.mesh.visible = true; f.mesh.scale.setScalar(1); f.lit = true; });
+}
+
+function spawnSmoke(x,y,z){
+  const geo = new THREE.SphereGeometry(0.035, 8, 8);
+  const mat = new THREE.MeshBasicMaterial({ color:0xcfcfcf, transparent:true, opacity:0.5 });
+  const m = new THREE.Mesh(geo, mat);
+  m.position.set(x,y,z);
+  scene.add(m);
+  const start = performance.now();
+  (function loop(){
+    const t = (performance.now()-start)/1000;
+    if(t>1.4){ scene.remove(m); return; }
+    m.position.y += 0.006;
+    m.scale.setScalar(1+t*1.8);
+    m.material.opacity = 0.5*(1-t/1.4);
+    requestAnimationFrame(loop);
+  })();
+}
+
+function triggerShake(durMs, mag){
+  if(reduceMotion) return;
+  shakeUntil = performance.now() + durMs;
+  shakeMag = mag;
+}
+function flashScreen(){
+  if(reduceMotion) return;
+  const el = document.getElementById('flash');
+  el.classList.add('on');
+  setTimeout(()=>el.classList.remove('on'), 160);
+}
+
+function animate(){
+  requestAnimationFrame(animate);
+  const t = clock.getElapsedTime();
+
+  if(cakeGroup && !knifeState.cutDone && !reduceMotion){
+    cakeGroup.rotation.y = Math.sin(t*0.15)*0.08;
+  }
+
+  candleFlames.forEach(f=>{
+    if(f.lit){
+      const flick = (Math.sin(t*14*f.speedMul + f.phase) * 0.06 + Math.sin(t*3*f.speedMul+f.phase)*0.03) * f.ampMul;
+      const ignite = candleIgniteMul;
+      f.mesh.scale.set((1+flick*0.4)*ignite, (1+flick)*ignite, (1+flick*0.4)*ignite);
+      f.light.intensity = candlesLit ? (1.3 + flick*1.4) * ignite : 0;
+    }
+  });
+
+  if(knifeGroup && knifeGroup.userData.glint){
+    knifeGroup.userData.glint.material.opacity = 0.6 + Math.sin(t*4)*0.3;
+  }
+
+  if(dustPoints && !reduceMotion){
+    const posAttr = dustPoints.geometry.attributes.position;
+    const speeds = dustPoints.userData.speeds;
+    for(let i=0;i<speeds.length;i++){
+      let y = posAttr.getY(i) + speeds[i]*0.01;
+      if(y > 3.2) y = -0.6;
+      posAttr.setY(i, y);
+    }
+    posAttr.needsUpdate = true;
+  }
+
+  if(knifeGroup && knifeState.revealed && !knifeState.cutDone){
+    knifeGroup.position.lerp(knifeTarget, 0.22);
+    const tilt = Math.PI/2 + 0.1 + knifeState.progress*0.18;
+    knifeGroup.rotation.z += (tilt - knifeGroup.rotation.z)*0.15;
+  }
+
+  camBase.lerp(camWanted, 0.02);
+  camera.position.copy(camBase);
+  camera.position.x += Math.sin(t*0.25)*0.06;
+  camera.position.y += Math.sin(t*0.19)*0.04;
+  if(performance.now() < shakeUntil){
+    camera.position.x += (Math.random()-0.5)*shakeMag;
+    camera.position.y += (Math.random()-0.5)*shakeMag;
+  }
+  camera.lookAt(0, 1.1, 0);
+
+  renderer && renderer.render(scene, camera);
+}
+
+function onResize(){
+  if(!renderer) return;
+  camera.aspect = wrap.clientWidth/wrap.clientHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(wrap.clientWidth, wrap.clientHeight);
+}
+
+/* ============================================================
+   5. STATE MACHINE
+   ============================================================ */
+const textTop = document.getElementById('text-top');
+const textCenter = document.getElementById('text-center');
+const textBottom = document.getElementById('text-bottom');
+const cutGuide = document.getElementById('cut-guide');
+const cakeWrap = document.getElementById('cake-canvas-wrap');
+const cakeGlowEl = document.getElementById('cake-glow');
+const vignetteEl = document.getElementById('vignette');
+const introGlowEl = document.getElementById('intro-glow');
+
+// let state = null;
+// let currentBg = 'intro';
+let stateTimer = null;
+
+function setBg(name){
+  currentBg = name;
+  document.querySelectorAll('.bg-layer').forEach(el=>{
+    el.classList.toggle('active', el.classList.contains('bg-'+name));
+  });
+}
+
+function setBlock(container, html, opts={}){
+  container.innerHTML = '';
+  if(!html) return null;
+  const div = document.createElement('div');
+  div.className = 'fade-block';
+  div.innerHTML = html;
+  container.appendChild(div);
+  requestAnimationFrame(()=>requestAnimationFrame(()=>div.classList.add('in')));
+  return div;
+}
+
+function showCutGuide(){ cutGuide.classList.remove('fading'); cutGuide.classList.add('on'); }
+function hideCutGuide(){ cutGuide.classList.remove('on'); cutGuide.classList.add('fading'); }
+
+function clearTimer(){ if(stateTimer){ clearTimeout(stateTimer); stateTimer = null; } }
+
+function setState(next){
+  clearTimer();
+  state = next;
+  document.body.setAttribute('data-state', next);
+
+  if(next === 'INTRO'){
+    setBg('intro');
+    vignetteEl.classList.remove('on');
+    cakeWrap.classList.remove('visible','dimmed');
+    cakeGlowEl.classList.remove('on');
+    introGlowEl.classList.add('on');
+    const b = setBlock(textCenter, `
+      <div class="eyebrow serif" style="font-style:italic;">${CONTENT.eyebrow}</div>
+      <h1 class="headline serif intro-headline">Happy Birthday</h1>
+      <div class="name-line intro-name">${CONTENT.name} ♡</div>
+      <p class="subline intro-rest">${CONTENT.subline}</p>
+      <p class="micro intro-rest">A little surprise for you...</p>
+    `);
+    setTimeout(()=>{
+      sparkleAroundEl(textCenter.querySelector('.name-line'), 8);
+      playChime();
+    }, 900);
+    textTop.innerHTML = ''; 
+    setBlock(textBottom, `
+  <p class="continue-hint">
+    Click or scroll to continue ↓
+  </p>
+`);
+    // Page 1 waits for the visitor: click/tap, scroll, swipe up, or
+    // ArrowDown/Space/Enter (see the manual-navigation module below).
+    // No auto-advance timer; the visible hint tells the visitor how to continue.
+  }
+
+  else if(next === 'WISH'){
+    setBg('wish');
+    introGlowEl.classList.remove('on');
+    cakeGlowEl.classList.add('on');
+    playWhoosh();
+    revealWishLines();
+    setBlock(textBottom, `<p class="continue-hint">Click or scroll for the cake ↓</p>`);
+    textTop.innerHTML = '';
+    // Page 2 also waits for a manual continue — see manual-navigation module.
+  }
+
+  else if(next === 'CAKE_REVEAL'){
+    setBg('cake');
+    cakeGlowEl.classList.remove('on');
+    if(!sceneReady){ initScene(); prepareCutHalves(); setupCutDrag(); }
+    playWhoosh();
+    spawnConvergingParticles();
+    fadeOutIn(textCenter, `<p class="micro" style="letter-spacing:0.14em;">Wait for it...</p>`);
+    textTop.innerHTML = ''; textBottom.innerHTML = '';
+    stateTimer = setTimeout(()=>{
+      textCenter.innerHTML = '';
+      cakeWrap.classList.add('visible');
+      vignetteEl.classList.add('on');
+      cakeGlowEl.classList.add('on');
+      revealLights();
+      animateVal(0, 1, 1900, v=>{ candleIgniteMul = v; });
+      animateVal(0, isMobile?0.55:0.85, 2000, v=>{ if(dustPoints) dustPoints.material.opacity = v; });
+      stateTimer = setTimeout(()=>setState('MAKE_WISH'), reduceMotion ? 600 : 2600);
+    }, reduceMotion ? 300 : 1400);
+  }
+
+  else if(next === 'MAKE_WISH'){
+    setBg('candles');
+    camWanted.set(0, 2.35, 6.5);
+
+    const b = setBlock(textTop, `
+      <div class="cake-caption serif">Make a wish ✨</div>
+      <div class="cake-sub">Close your eyes… and hold it in your heart.</div>
+    `);
+    if(b) b.classList.add('rise');
+
+    // Give the visitor a reliable manual interaction instead of forcing
+    // the scene to advance after a short timeout.
+    setBlock(textBottom, `
+      <button class="btn solid" id="btn-wish" type="button">Wish made ✨</button>
+      <div class="cake-sub" style="margin-top:10px;">Or simply wait for the candles to fade.</div>
+    `);
+    document.getElementById('btn-wish').addEventListener('click', triggerWishMade);
+
+    setTimeout(()=>spawnSparkles(0.5, 0.16, 8, 220), 700);
+
+    stateTimer = setTimeout(()=>{
+      if(state !== 'MAKE_WISH') return;
+      triggerWishMade();
+    }, reduceMotion ? 1800 : 9000);
+  }
+
+  else if(next === 'CANDLES_BLOWN'){
+    setBg('candles');
+    blowOutCandles();
+    fadeOutIn(textTop, `<div class="cake-caption serif">Wish made. ♡</div>`);
+    textBottom.innerHTML = '';
+    stateTimer = setTimeout(()=>setState('KNIFE_READY'), reduceMotion ? 500 : 2200);
+  }
+
+  else if(next === 'KNIFE_READY'){
+    setBg('cut');
+    revealKnife();
+    camWanted.set(0.15, 2.5, 6.2);
+    fadeOutIn(textTop, `
+      <div class="cake-caption serif">Cut the cake 🎂</div>
+      <div class="cake-sub">Drag the knife down through the cake</div>
+    `);
+    textBottom.innerHTML = '';
+    showCutGuide();
+  }
+
+  else if(next === 'CUTTING'){
+    setBg('cut');
+    // A gentle push toward the cake while it's being cut.
+    camWanted.set(0.08, 2.42, 5.85);
+  }
+
+  else if(next === 'CELEBRATION'){
+    setBg('celebration');
+    flashScreen(); // brief glow burst — the biggest visual payoff starts here
+    camWanted.set(0, 2.1, 7.2); // camera gently pulls back
+    vignetteEl.classList.remove('on');
+    cakeWrap.classList.add('dimmed');
+    cakeGlowEl.classList.remove('on');
+    textTop.innerHTML = '';
+    const b = setBlock(textCenter, `
+      <h2 class="celebration-title serif">HAPPY BIRTHDAY ${CONTENT.name.toUpperCase()}! 🎂</h2>
+      <p class="celebration-sub">${CONTENT.celebrationSub}</p>
+    `);
+    setTimeout(()=>sparkleAroundEl(textCenter.querySelector('.celebration-title'), 10), 400);
+    setBlock(textBottom, `<button class="btn dark" id="btn-again">Celebrate Again ✨</button>`);
+    document.getElementById('btn-again').addEventListener('click', resetExperience);
+    launchConfetti();
+    musicHappiestPoint();
+  }
+}
+
+/* Page 2's message reveals line by line instead of appearing all at once. */
+function revealWishLines(){
+  const doReveal = ()=>{
+    textCenter.innerHTML = '';
+    const wrap = document.createElement('div');
+    wrap.className = 'fade-block in';
+    wrap.innerHTML = `
+      <svg class="stroke-heart" viewBox="0 0 46 40"><path d="M23 37C10 28 3 20 3 12.5 3 6 8 2 14 2c4.5 0 7.5 2.5 9 5.5C24.5 4.5 27.5 2 32 2c6 0 11 4 11 10.5 0 7.5-7 15.5-20 24.5Z"/></svg>
+      <div class="wish-kicker wish-line" style="animation-delay:.15s">${CONTENT.wishKicker}</div>
+      <p class="wish-text serif wish-line" style="animation-delay:.6s">${CONTENT.wish1}</p>
+      <p class="wish-text small serif wish-line" style="animation-delay:1.15s">${CONTENT.wish2}</p>
+    `;
+    textCenter.appendChild(wrap);
+  };
+  const old = textCenter.querySelector('.fade-block');
+  if(old){
+    old.classList.remove('in'); old.classList.add('out');
+    setTimeout(doReveal, reduceMotion ? 0 : 380);
+  } else {
+    doReveal();
+  }
+}
+
+function fadeOutIn(container, html){
+  const old = container.querySelector('.fade-block');
+  if(old){
+    old.classList.remove('in'); old.classList.add('out');
+    setTimeout(()=>setBlock(container, html), reduceMotion ? 0 : 380);
+  } else {
+    setBlock(container, html);
+  }
+}
+
+/* ---- mic blow detection ---- */
+let audioCtx, analyser, micStream, micRAF;
+async function enableMicListen(){
+  if(audioCtx) return;
+  const micIcon = document.getElementById('mic-icon');
+  const micHint = document.getElementById('mic-hint');
+  try{
+    micStream = await navigator.mediaDevices.getUserMedia({ audio:true });
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const source = audioCtx.createMediaStreamSource(micStream);
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 512;
+    source.connect(analyser);
+    if(micIcon) micIcon.classList.add('active');
+    if(micHint) micHint.textContent = 'Listening... blow now';
+    const data = new Uint8Array(analyser.frequencyBinCount);
+    let sustained = 0;
+    function loop(){
+      if(state !== 'MAKE_WISH'){ return; }
+      analyser.getByteFrequencyData(data);
+      const lowFreqAvg = data.slice(0, 12).reduce((a,b)=>a+b,0)/12;
+      if(lowFreqAvg > 55){ sustained++; } else { sustained = Math.max(0, sustained-1); }
+      if(sustained > 6){ triggerWishMade(); stopMic(); return; }
+      micRAF = requestAnimationFrame(loop);
+    }
+    loop();
+  }catch(err){
+    if(micHint) micHint.textContent = 'Microphone unavailable — use the button below';
+  }
+}
+function stopMic(){
+  if(micRAF) cancelAnimationFrame(micRAF);
+  micRAF = null;
+  if(micStream) micStream.getTracks().forEach(t=>t.stop());
+  micStream = null;
+  if(audioCtx) audioCtx.close();
+  audioCtx = null;
+  const micIcon = document.getElementById('mic-icon');
+  if(micIcon) micIcon.classList.remove('active');
+}
+function triggerWishMade(){
+  if(state !== 'MAKE_WISH') return;
+  setState('CANDLES_BLOWN');
+}
+
+/* ============================================================
+   6. Confetti
+   ============================================================ */
+const confettiCanvas = document.getElementById('confetti-canvas');
+const cctx = confettiCanvas.getContext('2d');
+let confettiParticles = [];
+function resizeConfetti(){ confettiCanvas.width = window.innerWidth; confettiCanvas.height = window.innerHeight; }
+resizeConfetti();
+window.addEventListener('resize', resizeConfetti);
+const confettiColors = ['#e2a3b3','#c67f92','#f3d9de','#d8b98a','#ece3f2','#ffffff'];
+function launchConfetti(){
+  const count = isMobile ? 70 : 150;
+  for(let i=0;i<count;i++){
+    confettiParticles.push({
+      x: Math.random()*confettiCanvas.width, y: -20 - Math.random()*200,
+      w: 5+Math.random()*6, h: 8+Math.random()*8,
+      color: confettiColors[Math.floor(Math.random()*confettiColors.length)],
+      speed: 1.5+Math.random()*2.5, drift: (Math.random()-0.5)*1.6,
+      rot: Math.random()*Math.PI, rotSpeed: (Math.random()-0.5)*0.15,
+      isHeart: Math.random() > 0.8
+    });
+  }
+  if(!confettiRunning){ confettiRunning = true; runConfetti(); }
+  setTimeout(()=>{ confettiParticles = confettiParticles.slice(0, Math.floor(confettiParticles.length*0.3)); }, 4000);
+}
+let confettiRunning = false;
+function runConfetti(){
+  cctx.clearRect(0,0,confettiCanvas.width, confettiCanvas.height);
+  confettiParticles.forEach(p=>{
+    p.y += p.speed; p.x += p.drift; p.rot += p.rotSpeed;
+    cctx.save(); cctx.translate(p.x,p.y); cctx.rotate(p.rot); cctx.fillStyle = p.color;
+    if(p.isHeart){
+      cctx.beginPath(); cctx.moveTo(0,2);
+      cctx.bezierCurveTo(0,0,-4,0,-4,2); cctx.bezierCurveTo(-4,4,0,6,0,7.5);
+      cctx.bezierCurveTo(0,6,4,4,4,2); cctx.bezierCurveTo(4,0,0,0,0,2); cctx.fill();
+    } else { cctx.fillRect(-p.w/2, -p.h/2, p.w, p.h); }
+    cctx.restore();
+  });
+  confettiParticles = confettiParticles.filter(p => p.y < confettiCanvas.height + 40);
+  if(confettiParticles.length > 0){ requestAnimationFrame(runConfetti); }
+  else { confettiRunning = false; cctx.clearRect(0,0,confettiCanvas.width, confettiCanvas.height); }
+}
+
+/* ============================================================
+   7. Music — mobile-safe single-Audio-element implementation
+   ============================================================
+
+   EDIT THIS to point at wherever the MP3 actually lives once deployed.
+   This must resolve as an absolute URL path on the live site.
+
+     - If your static/Vercel deployment serves files placed directly in
+       the project's `public/` folder, and the MP3 sits at
+         public/riverbend-serenade.mp3
+       then use:  "/riverbend-serenade.mp3"
+
+     - If instead your project structure is
+         public/audio/riverbend-serenade.mp3
+       then use:  "/audio/riverbend-serenade.mp3"
+
+   A relative path like "./riverbend-serenade.mp3" only works if this
+   HTML file is served from the exact same folder as the MP3 — it breaks
+   the moment the page is served from a different route (a common cause
+   of "works locally, silent on mobile/deployed site"). Always verify by
+   opening the final URL directly in a browser tab after deploying.
+*/
+const MUSIC_SRC = "/riverbend-serenade.mp3"; // <-- verify this against your actual deployed file path
+const MUSIC_DEBUG = true; // set to false once everything is confirmed working
+
+function musicLog(...args){ if(MUSIC_DEBUG) console.log('[Music]', ...args); }
+
+let audioEl = null;
+let musicPlaying = false;
+let musicUnavailable = false;
+let musicUserMuted = false;
+let musicFadeRAF = null;
+let musicUnlockPromise = null; // in-flight play() promise from the knife gesture
+
+function getAudioEl(){
+  if(audioEl) return audioEl;
+  if(!MUSIC_SRC) return null;
+
+  audioEl = new Audio();
+  audioEl.preload = 'auto';
+  audioEl.loop = true;
+  audioEl.playsInline = true;
+  audioEl.setAttribute('playsinline', '');
+  audioEl.setAttribute('webkit-playsinline', '');
+  audioEl.volume = 0;
+  audioEl.src = MUSIC_SRC;
+
+  musicLog('source:', MUSIC_SRC);
+
+  audioEl.addEventListener('loadeddata', ()=> musicLog('loadeddata — readyState:', audioEl.readyState));
+  audioEl.addEventListener('canplay', ()=> musicLog('canplay — readyState:', audioEl.readyState));
+  audioEl.addEventListener('canplaythrough', ()=> musicLog('canplaythrough'));
+  audioEl.addEventListener('error', ()=>{
+    musicUnavailable = true;
+    musicLog('ERROR loading audio — code:', audioEl.error?.code, 'message:', audioEl.error?.message, 'src:', MUSIC_SRC);
+  });
+
+  // Start loading right away (not "load() right before play()") so the
+  // file is already buffered by the time the knife gesture happens.
+  audioEl.load();
+
+  return audioEl;
+}
+
+/*
+ * Early unlock — called on the very first user gesture.
+ * Satisfies autoplay policy early and gives the file time to buffer
+ * before the knife cut. Tries a couple of times if needed.
+ */
+function unlockMusicEarly() {
+  if (musicUserMuted || !MUSIC_SRC) return;
+  const el = getAudioEl();
+  if (!el || musicPlaying) return;
+
+  const tryUnlock = (attempt = 1) => {
+    el.volume = 0;
+    el.play().then(() => {
+      // keep it muted – we only wanted the unlock
+      el.pause();
+      try { el.currentTime = 0; } catch (_) {}
+      musicLog('early unlock succeeded (attempt ' + attempt + ')');
+    }).catch(err => {
+      musicLog('early unlock failed (attempt ' + attempt + ')', err?.name);
+      if (attempt < 3) {
+        setTimeout(() => tryUnlock(attempt + 1), 400 * attempt);
+      }
+    });
+  };
+  tryUnlock();
+}
+
+let fallbackHideTimer = null;
+
+function showMusicFallback() {
+  if (!musicFallback) return;
+  musicFallback.classList.remove('hiding');
+  musicFallback.classList.add('show', 'pulse');
+  // Auto-hide after ~6.5 seconds so it never lingers
+  if (fallbackHideTimer) clearTimeout(fallbackHideTimer);
+  fallbackHideTimer = setTimeout(() => {
+    hideMusicFallback();
+  }, 6500);
+}
+
+function hideMusicFallback() {
+  if (!musicFallback) return;
+  if (fallbackHideTimer) {
+    clearTimeout(fallbackHideTimer);
+    fallbackHideTimer = null;
+  }
+  musicFallback.classList.remove('pulse');
+  musicFallback.classList.add('hiding');
+  setTimeout(() => {
+    musicFallback.classList.remove('show', 'hiding');
+  }, 520);
+}
+
+/*
+ * Called synchronously from the knife's pointerdown handler — a real user
+ * gesture — so mobile browsers allow the play() call. Keeps the audio at
+ * volume 0. Only ever one play() request in flight: concurrent calls
+ * reuse the same promise instead of stacking up new ones. musicPlaying is
+ * only set to true once play() has actually resolved.
+ * Includes a short retry if the first attempt fails (common when the
+ * file just finished buffering).
+ */
+function unlockMusicFromGesture(){
+  if(musicUserMuted || !MUSIC_SRC) return Promise.resolve(false);
+
+  const el = getAudioEl();
+  if(!el) return Promise.resolve(false);
+
+  // Already playing → nothing to do
+  if(musicPlaying && !el.paused){
+    return Promise.resolve(true);
+  }
+
+  // Re-use in-flight promise so we never stack play() calls
+  if(musicUnlockPromise) return musicUnlockPromise;
+
+  el.volume = 0;
+  musicLog('unlockMusicFromGesture: calling play() — readyState:', el.readyState, 'paused:', el.paused);
+
+  musicUnlockPromise = el.play()
+    .then(()=>{
+      musicPlaying = true;
+      musicUnavailable = false;
+      musicToggle?.classList.add('playing');
+      hideMusicFallback();
+      musicLog('knife unlock succeeded');
+      return true;
+    })
+    .catch((err)=>{
+      musicPlaying = false;
+      musicLog('knife unlock rejected', err?.name, err?.message);
+      // one silent retry after a short delay (helps when the file just finished buffering)
+      return new Promise(resolve => {
+        setTimeout(() => {
+          el.play().then(() => {
+            musicPlaying = true;
+            musicUnavailable = false;
+            musicToggle?.classList.add('playing');
+            hideMusicFallback();
+            musicLog('knife unlock retry succeeded');
+            resolve(true);
+          }).catch(() => {
+            // Only show the gentle fallback if everything really failed
+            showMusicFallback();
+            resolve(false);
+          });
+        }, 350);
+      });
+    })
+    .finally(()=>{
+      musicUnlockPromise = null;
+    });
+
+  return musicUnlockPromise;
+}
+
+function rampMusicVolume(target, durMs){
+  if(!audioEl) return;
+  if(musicFadeRAF){ cancelAnimationFrame(musicFadeRAF); musicFadeRAF = null; }
+  const from = audioEl.volume, t0 = performance.now();
+  function step(now){
+    if(!audioEl) return;
+    const t = Math.min(1, (now - t0)/durMs);
+    audioEl.volume = from + (target - from) * t;
+    if(t < 1) musicFadeRAF = requestAnimationFrame(step);
+    else musicFadeRAF = null;
+  }
+  musicFadeRAF = requestAnimationFrame(step);
+}
+
+/*
+ * Called exactly when CELEBRATION begins. Waits for the gesture-time
+ * unlock if it's still in flight (this is what fixes the "works on the
+ * second attempt" bug — the celebration used to check `musicPlaying`
+ * before the first-attempt play() promise had actually settled). Falls
+ * back to a direct play() if the gesture-time attempt was rejected, and
+ * only shows the manual "Tap for music" fallback if that also fails.
+ */
+async function musicHappiestPoint(){
+  if(musicUserMuted || !MUSIC_SRC) return;
+
+  const el = getAudioEl();
+  if(!el) return;
+
+  // Wait for any in-flight unlock
+  if(musicUnlockPromise) await musicUnlockPromise;
+
+  if(musicPlaying && !el.paused){
+    try{ el.currentTime = 0; }catch(err){}
+    el.volume = 0;
+    rampMusicVolume(0.66, 1200);
+    hideMusicFallback();
+    musicLog('celebration: fading in already-unlocked audio');
+    return;
+  }
+
+  // Last-chance play (try twice)
+  el.volume = 0;
+  try{ el.currentTime = 0; }catch(err){}
+
+  const attemptPlay = async () => {
+    try {
+      await el.play();
+      musicPlaying = true;
+      musicUnavailable = false;
+      musicToggle?.classList.add('playing');
+      hideMusicFallback();
+      rampMusicVolume(0.66, 1200);
+      musicLog('celebration: last-chance play succeeded');
+      return true;
+    } catch (err) {
+      return false;
+    }
+  };
+
+  if (await attemptPlay()) return;
+
+  // One more silent retry
+  await new Promise(r => setTimeout(r, 400));
+  if (await attemptPlay()) return;
+
+  musicLog('celebration: play blocked → showing subtle fallback');
+  showMusicFallback();
+}
+
+const musicToggle = document.getElementById('music-toggle');
+const musicFallback = document.getElementById('music-fallback');
+
+if(musicToggle){
+  musicToggle.addEventListener('click', ()=>{
+    if(!MUSIC_SRC) return;
+    const el = getAudioEl();
+    if(!el) return;
+
+    if(musicFadeRAF){ cancelAnimationFrame(musicFadeRAF); musicFadeRAF = null; }
+
+    if(musicPlaying && !el.paused){
+      el.pause();
+      musicPlaying = false;
+      musicUserMuted = true;
+      musicToggle.classList.remove('playing');
+    } else {
+      musicUserMuted = false;
+      const startVol = el.volume < 0.02 ? 0 : el.volume;
+      el.volume = startVol;
+      el.play().then(()=>{
+        musicPlaying = true;
+        musicToggle.classList.add('playing');
+        hideMusicFallback();
+        if(el.volume < 0.02) rampMusicVolume(0.66, 800);
+      }).catch((err)=>{
+        musicLog('manual toggle play() failed —', err?.name, err?.message);
+        showMusicFallback();
+      });
+    }
+  });
+}
+
+if(musicFallback){
+  musicFallback.addEventListener('click', ()=>{
+    const el = getAudioEl();
+    if(!el) return;
+    musicUserMuted = false;
+    el.volume = 0;
+    try{ el.currentTime = 0; }catch(err){}
+    el.play().then(()=>{
+      musicPlaying = true;
+      musicUnavailable = false;
+      hideMusicFallback();
+      musicToggle?.classList.add('playing');
+      rampMusicVolume(0.66, 1200);
+    }).catch((err)=>{
+      musicLog('manual fallback play() failed —', err?.name, err?.message);
+    });
+  });
+}
+
+/* ============================================================
+   8. Manual page navigation (Page 1 → Page 2 → cake)
+   Click/tap, scroll down, swipe up, or ArrowDown/Space/Enter.
+   This is also where the SFX audio context first unlocks, satisfying
+   the browser's autoplay policy for the synthesized chime/whoosh/slice
+   sounds — separate from the music, which unlocks during the knife cut.
+   ============================================================ */
+let firstInteractionDone = false;
+let navBusy = false;
+
+function ensureFirstInteraction(){
+  if(firstInteractionDone) return;
+  firstInteractionDone = true;
+  const ctx = getSfxCtx();
+  if(ctx && ctx.state === 'suspended') ctx.resume().catch(()=>{});
+}
+
+['pointerdown','keydown','touchstart','wheel'].forEach(evt=>{
+  window.addEventListener(evt, ()=>{
+    ensureFirstInteraction();
+    unlockMusicEarly();          // early silent unlock so the file is ready later
+  }, { once:true, passive:true });
+});
+
+function requestAdvance(){
+  if(navBusy) return;
+  if(state === 'INTRO'){
+    navBusy = true;
+    setState('WISH');
+    setTimeout(()=>{ navBusy = false; }, 900);
+  } else if(state === 'WISH'){
+    navBusy = true;
+    setState('CAKE_REVEAL');
+    setTimeout(()=>{ navBusy = false; }, 900);
+  }
+}
+
+const NAV_IGNORE_SELECTOR = '.btn, #music-toggle, #music-fallback, .mic-icon, #cursor-dot';
+
+window.addEventListener('click', (e)=>{
+  if(e.target.closest && e.target.closest(NAV_IGNORE_SELECTOR)) return;
+  requestAdvance();
+}, { passive:true });
+
+let wheelLocked = false;
+window.addEventListener('wheel', (e)=>{
+  if(e.deltaY > 12 && !wheelLocked){
+    wheelLocked = true;
+    requestAdvance();
+    setTimeout(()=>{ wheelLocked = false; }, 1000);
+  }
+}, { passive:true });
+
+let touchStartY = null;
+window.addEventListener('touchstart', (e)=>{
+  touchStartY = e.touches && e.touches[0] ? e.touches[0].clientY : null;
+}, { passive:true });
+window.addEventListener('touchend', (e)=>{
+  if(touchStartY == null) return;
+  const endY = e.changedTouches && e.changedTouches[0] ? e.changedTouches[0].clientY : touchStartY;
+  const dy = touchStartY - endY;
+  touchStartY = null;
+  if(dy > 40){ // swipe up
+    if(e.target.closest && e.target.closest(NAV_IGNORE_SELECTOR)) return;
+    requestAdvance();
+  }
+}, { passive:true });
+
+window.addEventListener('keydown', (e)=>{
+  if(state !== 'INTRO' && state !== 'WISH') return;
+  if(e.key === 'ArrowDown' || e.key === ' ' || e.key === 'Spacebar' || e.key === 'Enter'){
+    e.preventDefault();
+    requestAdvance();
+  }
+});
+
+/* ============================================================
+   9. Reset / replay
+   ============================================================ */
+function resetExperience(){
+  clearTimer();
+  stopMic();
+
+  if(musicFadeRAF){ cancelAnimationFrame(musicFadeRAF); musicFadeRAF = null; }
+  if(audioEl){ audioEl.pause(); try{ audioEl.currentTime = 0; }catch(err){} audioEl.volume = 0; }
+  musicPlaying = false;
+  musicUnlockPromise = null;
+  musicToggle?.classList.remove('playing');
+  musicFallback?.classList.remove('show');
+
+  confettiParticles = [];
+  navBusy = false;
+
+  if(sceneReady){
+    relightCandles();
+    resetClip();
+    knifeState = { revealed:false, dragging:false, progress:0, cutDone:false };
+    knifeGroup.visible = false;
+    knifeGroup.position.copy(knifeStart.pos);
+    knifeGroup.rotation.copy(knifeStart.rot);
+    knifeTarget.copy(knifeStart.pos);
+    camWanted.set(0, 2.1, 7.2);
+  }
+  hideCutGuide();
+  setState('INTRO');
+}
+
+/* ============================================================
+   10. Boot
+   ============================================================ */
+spawnPetals();
+getAudioEl(); // kick off loading the track early so it's ready well before the knife gesture
 setState('INTRO');
 </script>
 </body>
 </html>
-
